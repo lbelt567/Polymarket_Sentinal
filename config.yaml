@@ -1,0 +1,74 @@
+gatekeeper:
+  gamma_api_url: "https://gamma-api.polymarket.com"
+  endpoint: "/events"
+  poll_interval_sec: 300
+  min_volume_24h: 10000
+  min_liquidity: 5000
+  max_markets: 200
+  excluded_categories: ["Sports"]
+  excluded_tag_slugs: ["sports"]
+  stale_timeout_sec: 1800
+  page_size: 100
+  order_by: "volume24hr"
+  ascending: false
+
+websocket:
+  url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  heartbeat_interval_sec: 10
+  reconnect_base_delay_sec: 1
+  reconnect_max_delay_sec: 60
+  custom_feature_enabled: true
+  max_spread_for_midpoint: 0.10
+  max_quote_age_sec: 15
+
+detector:
+  check_interval_sec: 1
+  buffer_max_age_sec: 360
+  bar_interval_sec: 1
+  cooldown_sec: 300
+  stale_threshold_sec: 120
+  max_spread_for_detection: 0.15
+  max_quote_age_sec: 15
+  warmup_grace_sec: 60
+  thresholds:
+    scout:
+      window_sec: 60
+      delta_pct: 8.0
+      min_ticks: 3
+    confirmation:
+      window_sec: 180
+      delta_pct: 5.0
+      min_ticks: 5
+    trend:
+      window_sec: 300
+      delta_pct: 5.0
+      min_ticks: 10
+
+storage:
+  sqlite_path: "data/sentinel.db"
+  hot_retention_hours: 48
+  archive_dir: "data/archive"
+  archive_interval_sec: 3600
+
+notifications:
+  enabled_channels: ["json_file"]
+  min_severity: "confirmation"
+  allowed_levels: ["confirmation", "trend"]
+  excluded_confidences: ["weak"]
+  excluded_signal_sources: ["last_trade"]
+  min_price: 0.03
+  max_price: 0.98
+  min_liquidity: 25000
+  event_dedup_sec: 900
+  json_file_dir: "data/alerts"
+  json_webhook_url: ""
+  discord_webhook_url: "${DISCORD_WEBHOOK_URL}"
+  telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
+  telegram_chat_id: "${TELEGRAM_CHAT_ID}"
+
+metrics:
+  log_interval_sec: 60
+
+logging:
+  level: "INFO"
+  file: "data/sentinel.log"
