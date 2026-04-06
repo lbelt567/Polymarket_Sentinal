@@ -22,8 +22,16 @@ class Metrics:
     alerts_trend: int = 0
     alerts_skipped_cooldown: int = 0
     alerts_skipped_quality: int = 0
+    alerts_skipped_policy: int = 0
+    alerts_skipped_event_dedup: int = 0
+    alerts_dispatched: int = 0
+    notifier_failures: int = 0
+    retention_deleted_shift_events: int = 0
+    retention_deleted_alert_files: int = 0
+    retention_deleted_archive_files: int = 0
     archive_lag_sec: float = 0.0
     last_gatekeeper_run_iso: str = ""
+    last_retention_run_iso: str = ""
     signal_source_counts: Counter[str] = field(default_factory=Counter)
     _ticks_window: list[int] = field(default_factory=list, repr=False)
 
@@ -56,13 +64,24 @@ class Metrics:
             "alerts_trend": self.alerts_trend,
             "alerts_skipped_cooldown": self.alerts_skipped_cooldown,
             "alerts_skipped_quality": self.alerts_skipped_quality,
+            "alerts_skipped_policy": self.alerts_skipped_policy,
+            "alerts_skipped_event_dedup": self.alerts_skipped_event_dedup,
+            "alerts_dispatched": self.alerts_dispatched,
+            "notifier_failures": self.notifier_failures,
+            "retention_deleted_shift_events": self.retention_deleted_shift_events,
+            "retention_deleted_alert_files": self.retention_deleted_alert_files,
+            "retention_deleted_archive_files": self.retention_deleted_archive_files,
             "archive_lag_sec": self.archive_lag_sec,
             "last_gatekeeper_run_iso": self.last_gatekeeper_run_iso,
+            "last_retention_run_iso": self.last_retention_run_iso,
             "signal_source_counts": dict(self.signal_source_counts),
         }
 
     def mark_gatekeeper_run(self) -> None:
         self.last_gatekeeper_run_iso = datetime.now(timezone.utc).isoformat()
+
+    def mark_retention_run(self) -> None:
+        self.last_retention_run_iso = datetime.now(timezone.utc).isoformat()
 
 
 async def log_metrics_forever(metrics: Metrics, interval_sec: int, logger: logging.Logger) -> None:

@@ -59,7 +59,9 @@ def test_archiver_writes_parquet_and_replay_updates_virtual_clock(tmp_path: Path
             StorageConfig(
                 sqlite_path=":memory:",
                 hot_retention_hours=48,
+                shift_event_retention_days=30,
                 archive_dir=str(tmp_path),
+                archive_retention_days=90,
                 archive_interval_sec=3600,
             ),
             store,

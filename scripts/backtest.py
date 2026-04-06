@@ -59,6 +59,7 @@ async def _run_backtest(parquet_glob: str, metadata_glob: str, speed: float) -> 
                 min_price=0.0,
                 max_price=1.0,
                 min_liquidity=0.0,
+                min_abs_move=0.0,
                 event_dedup_sec=0,
             ),
         ),

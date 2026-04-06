@@ -14,8 +14,10 @@ from sentinel.notifications.json_webhook import HttpJsonWebhookNotifier, JsonFil
 from sentinel.notifications.telegram import TelegramNotifier
 from sentinel.processing.alerts import AlertLevel
 from sentinel.processing.detector import ShiftDetector
+from sentinel.processing.enrichment import BeforeStateEnricher
 from sentinel.processing.stream import LiveStream
 from sentinel.storage.archiver import Archiver
+from sentinel.storage.retention import RetentionManager
 from sentinel.storage.sqlite_store import SQLiteStore
 from sentinel.utils.metrics import Metrics, log_metrics_forever
 
@@ -42,12 +44,22 @@ class SentinelApp:
                 min_price=self._config.notifications.min_price,
                 max_price=self._config.notifications.max_price,
                 min_liquidity=self._config.notifications.min_liquidity,
+                min_abs_move=self._config.notifications.min_abs_move,
                 event_dedup_sec=self._config.notifications.event_dedup_sec,
             ),
+            metrics=self._metrics,
+            enricher=BeforeStateEnricher(self._store),
         )
         detector = ShiftDetector(self._config.detector, self._store, dispatcher, self._metrics, self._time_fn)
         gatekeeper = Gatekeeper(self._config.gatekeeper, self._store, self._command_queue, self._metrics, self._time_fn)
         archiver = Archiver(self._config.storage, self._store, self._metrics, self._time_fn)
+        retention = RetentionManager(
+            self._config.storage,
+            self._config.notifications,
+            self._store,
+            self._metrics,
+            self._time_fn,
+        )
 
         async def on_market_resolved(event: MarketResolvedEvent) -> None:
             asset_ids = event.asset_ids
@@ -73,6 +85,7 @@ class SentinelApp:
             asyncio.create_task(detector.ingest_loop(LiveStream(self._tick_queue)), name="ingest"),
             asyncio.create_task(detector.scan_loop(), name="scan"),
             asyncio.create_task(archiver.run_forever(), name="archiver"),
+            asyncio.create_task(retention.run_forever(), name="retention"),
             asyncio.create_task(log_metrics_forever(self._metrics, self._config.metrics.log_interval_sec, self._logger), name="metrics"),
         ]
         try:
@@ -90,7 +103,16 @@ class SentinelApp:
         if "json_file" in channels:
             notifiers.append(JsonFileNotifier(self._config.notifications.json_file_dir))
         if "json_webhook" in channels and self._config.notifications.json_webhook_url:
-            notifiers.append(HttpJsonWebhookNotifier(self._config.notifications.json_webhook_url))
+            notifiers.append(
+                HttpJsonWebhookNotifier(
+                    self._config.notifications.json_webhook_url,
+                    timeout_sec=self._config.notifications.json_webhook_timeout_sec,
+                    max_retries=self._config.notifications.json_webhook_max_retries,
+                    retry_backoff_sec=self._config.notifications.json_webhook_retry_backoff_sec,
+                    bearer_token=self._config.notifications.json_webhook_bearer_token,
+                    hmac_secret=self._config.notifications.json_webhook_hmac_secret,
+                )
+            )
         if "discord" in channels and self._config.notifications.discord_webhook_url:
             notifiers.append(DiscordNotifier(self._config.notifications.discord_webhook_url))
         if "telegram" in channels and self._config.notifications.telegram_bot_token and self._config.notifications.telegram_chat_id:

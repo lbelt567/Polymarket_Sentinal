@@ -269,6 +269,21 @@ class SQLiteStore:
             )
         return [dict(row) for row in rows]
 
+    async def fetch_price_ticks_for_asset(self, asset_id: str, start_ms: int, end_ms: int) -> list[dict[str, object]]:
+        async with self._lock:
+            rows = await asyncio.to_thread(
+                self._query,
+                """
+                SELECT asset_id, market_slug, price, best_bid, best_ask, spread,
+                       signal_source, quote_ts_ms, ts_ms
+                FROM price_ticks
+                WHERE asset_id = ? AND ts_ms >= ? AND ts_ms < ?
+                ORDER BY ts_ms ASC
+                """,
+                (asset_id, start_ms, end_ms),
+            )
+        return [dict(row) for row in rows]
+
     async def delete_price_ticks_before(self, cutoff_ms: int) -> None:
         async with self._lock:
             await asyncio.to_thread(
@@ -276,6 +291,16 @@ class SQLiteStore:
                 "DELETE FROM price_ticks WHERE ts_ms < ?",
                 (cutoff_ms,),
             )
+
+    async def delete_shift_events_before(self, cutoff_ms: int) -> int:
+        def _delete() -> int:
+            cursor = self.connection.execute("DELETE FROM shift_events WHERE ts_ms < ?", (cutoff_ms,))
+            deleted = int(cursor.rowcount if cursor.rowcount != -1 else 0)
+            self.connection.commit()
+            return deleted
+
+        async with self._lock:
+            return await asyncio.to_thread(_delete)
 
     def _row_to_market(self, row: sqlite3.Row) -> MarketMetadata:
         return MarketMetadata(

@@ -47,7 +47,9 @@ detector:
 storage:
   sqlite_path: "data/sentinel.db"
   hot_retention_hours: 48
+  shift_event_retention_days: 30
   archive_dir: "data/archive"
+  archive_retention_days: 90
   archive_interval_sec: 3600
 
 notifications:
@@ -56,12 +58,19 @@ notifications:
   allowed_levels: ["confirmation", "trend"]
   excluded_confidences: ["weak"]
   excluded_signal_sources: ["last_trade"]
-  min_price: 0.03
+  min_price: 0.10
   max_price: 0.98
   min_liquidity: 25000
+  min_abs_move: 0.02
   event_dedup_sec: 900
   json_file_dir: "data/alerts"
+  json_file_retention_days: 30
   json_webhook_url: ""
+  json_webhook_bearer_token: "${JSON_WEBHOOK_BEARER_TOKEN}"
+  json_webhook_hmac_secret: "${JSON_WEBHOOK_HMAC_SECRET}"
+  json_webhook_timeout_sec: 10
+  json_webhook_max_retries: 3
+  json_webhook_retry_backoff_sec: 1.0
   discord_webhook_url: "${DISCORD_WEBHOOK_URL}"
   telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
   telegram_chat_id: "${TELEGRAM_CHAT_ID}"

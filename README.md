@@ -49,13 +49,15 @@ No API keys are needed for market data -- Polymarket's public endpoints are unau
 │  Agent Alert Policy (post-detection filter):            │
 │    - Confirmation + Trend only (no Scout)               │
 │    - Excludes weak confidence & last_trade signals      │
-│    - Price floor/ceiling ($0.03 - $0.98)                │
+│    - Price floor/ceiling ($0.10 - $0.98)                │
+│    - Minimum absolute move ($0.02)                      │
 │    - Min liquidity $25K for agent feed                  │
 │    - Event-level dedup (1 per event per 15 min)         │
 │                                                         │
 │  SQLite hot buffer (WAL, last 48h)                      │
 │  Archiver (hourly export to Parquet cold storage)       │
-│  Notifications (JSON file / webhook / Discord / Telegram│
+│  Notifications (JSON file / signed webhook / Discord /  │
+│  Telegram)                                              │
 └─────────────────────────────────────────────────────────┘
                │
                ▼
@@ -102,9 +104,46 @@ Each alert is a self-contained JSON document designed for AI agent consumption:
     "spread": 0.005,
     "liquidity_bucket": "high",
     "confidence": "strong"
+  },
+  "before_state": {
+    "lookback_30m": {
+      "window_sec": 1800,
+      "price_start": 0.47,
+      "price_end": 0.45,
+      "net_delta_pct": -4.2553,
+      "high": 0.48,
+      "low": 0.44,
+      "range_pct": 8.5106,
+      "position_in_range": 0.25,
+      "tick_count": 91,
+      "avg_spread": 0.0075
+    },
+    "lookback_60m": {
+      "window_sec": 3600,
+      "price_start": 0.49,
+      "price_end": 0.45,
+      "net_delta_pct": -8.1633,
+      "high": 0.5,
+      "low": 0.44,
+      "range_pct": 12.2449,
+      "position_in_range": 0.1667,
+      "tick_count": 151,
+      "avg_spread": 0.0081
+    },
+    "activity": {
+      "last_5m_tick_count": 18,
+      "prior_30m_avg_5m_tick_count": 6.5,
+      "tick_activity_ratio": 2.7692,
+      "last_5m_avg_spread": 0.01,
+      "prior_30m_avg_spread": 0.0074,
+      "spread_change_pct": 35.1351
+    },
+    "regime_label": "recovery_move"
   }
 }
 ```
+
+`before_state` is only added to agent-facing alerts after policy filtering and event dedup. It is meant to help downstream agents distinguish breakout, recovery, pullback, and choppy-regime moves without shipping raw tick history.
 
 ## Quick Start
 
@@ -195,11 +234,105 @@ notifications:
   allowed_levels: ["confirmation", "trend"]
   excluded_confidences: ["weak"]
   excluded_signal_sources: ["last_trade"]
-  min_price: 0.03
+  min_price: 0.10
   max_price: 0.98
   min_liquidity: 25000
+  min_abs_move: 0.02
   event_dedup_sec: 900              # One alert per event per 15 min
+  json_file_retention_days: 30
 ```
+
+### Storage Retention
+
+```yaml
+storage:
+  hot_retention_hours: 48
+  shift_event_retention_days: 30
+  archive_retention_days: 90
+  archive_interval_sec: 3600
+```
+
+Retention behavior:
+
+- `price_ticks` stay in SQLite only for `storage.hot_retention_hours`
+- `shift_events` are pruned after `storage.shift_event_retention_days`
+- archived parquet and `*.markets.json` snapshots are pruned after `storage.archive_retention_days`
+- JSON alert files are pruned after `notifications.json_file_retention_days`
+
+### Agent Webhook
+
+If your agent team is running as a service, enable `json_webhook` and point it at the agent ingress endpoint:
+
+```yaml
+notifications:
+  enabled_channels: ["json_file", "json_webhook"]
+  json_webhook_url: "https://agents.example.com/polymarket-alerts"
+  json_webhook_bearer_token: "${JSON_WEBHOOK_BEARER_TOKEN}"
+  json_webhook_hmac_secret: "${JSON_WEBHOOK_HMAC_SECRET}"
+  json_webhook_timeout_sec: 10
+  json_webhook_max_retries: 3
+  json_webhook_retry_backoff_sec: 1.0
+```
+
+The webhook sender adds:
+
+- `Authorization: Bearer ...` when configured
+- `X-Sentinel-Alert-Id`
+- `X-Sentinel-Alert-Level`
+- `X-Sentinel-Timestamp-Ms`
+- `X-Sentinel-Event-Slug` when available
+- `X-Sentinel-Signature: sha256=...` when `json_webhook_hmac_secret` is set
+
+That gives your downstream agents a durable local JSON outbox plus a signed HTTP delivery path.
+
+## 24/7 Deployment
+
+### Docker
+
+Build and run on a VM:
+
+```bash
+docker build -t polymarket-sentinel .
+docker run -d \
+  --name polymarket-sentinel \
+  --restart unless-stopped \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/config.yaml:/app/config.yaml:ro \
+  -v $(pwd)/.env:/app/.env:ro \
+  polymarket-sentinel
+```
+
+The image includes a healthcheck using [scripts/healthcheck.py](/Users/luisbeltranjr/Downloads/Polymarket_Sentinal/scripts/healthcheck.py).
+
+### systemd On A VM
+
+If you prefer a plain VM process instead of Docker:
+
+1. Create `/opt/polymarket-sentinel`
+2. Copy the repo there and create a virtualenv at `/opt/polymarket-sentinel/.venv`
+3. Install the package with `pip install -e .`
+4. Copy [deploy/systemd/polymarket-sentinel.service](/Users/luisbeltranjr/Downloads/Polymarket_Sentinal/deploy/systemd/polymarket-sentinel.service) to `/etc/systemd/system/`
+5. Run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-sentinel
+sudo systemctl status polymarket-sentinel
+```
+
+### Health Checks
+
+Use the bundled health script for cron, Docker, or external monitoring:
+
+```bash
+python scripts/healthcheck.py \
+  --sqlite-path data/sentinel.db \
+  --max-tick-age-sec 300 \
+  --max-gatekeeper-age-sec 900 \
+  --min-active-markets 25
+```
+
+It exits non-zero if market discovery is stale, ticks have stopped flowing, or active coverage collapses.
 
 ## Project Structure
 

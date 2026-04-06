@@ -53,6 +53,38 @@ class ShiftSummary:
 
 
 @dataclass(slots=True)
+class BeforeStateWindow:
+    window_sec: int
+    price_start: float | None
+    price_end: float | None
+    net_delta_pct: float | None
+    high: float | None
+    low: float | None
+    range_pct: float | None
+    position_in_range: float | None
+    tick_count: int
+    avg_spread: float | None
+
+
+@dataclass(slots=True)
+class BeforeStateActivity:
+    last_5m_tick_count: int
+    prior_30m_avg_5m_tick_count: float | None
+    tick_activity_ratio: float | None
+    last_5m_avg_spread: float | None
+    prior_30m_avg_spread: float | None
+    spread_change_pct: float | None
+
+
+@dataclass(slots=True)
+class BeforeState:
+    lookback_30m: BeforeStateWindow
+    lookback_60m: BeforeStateWindow
+    activity: BeforeStateActivity
+    regime_label: str
+
+
+@dataclass(slots=True)
 class ShiftAlert:
     alert_id: str
     alert_level: str
@@ -62,11 +94,14 @@ class ShiftAlert:
     market: dict[str, object]
     shift: ShiftSummary
     signal_quality: SignalQuality
+    before_state: BeforeState | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["shift"] = asdict(self.shift)
         payload["signal_quality"] = asdict(self.signal_quality)
+        if self.before_state is not None:
+            payload["before_state"] = asdict(self.before_state)
         return payload
 
     def to_json(self) -> str:
