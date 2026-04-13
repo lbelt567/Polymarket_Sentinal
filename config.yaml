@@ -47,9 +47,7 @@ detector:
 storage:
   sqlite_path: "data/sentinel.db"
   hot_retention_hours: 48
-  shift_event_retention_days: 30
   archive_dir: "data/archive"
-  archive_retention_days: 90
   archive_interval_sec: 3600
 
 notifications:
@@ -64,7 +62,6 @@ notifications:
   min_abs_move: 0.02
   event_dedup_sec: 900
   json_file_dir: "data/alerts"
-  json_file_retention_days: 30
   json_webhook_url: ""
   json_webhook_bearer_token: "${JSON_WEBHOOK_BEARER_TOKEN}"
   json_webhook_hmac_secret: "${JSON_WEBHOOK_HMAC_SECRET}"

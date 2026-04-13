@@ -1,0 +1,113 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pipeline-postgres:/var/lib/postgresql/data
+
+  sentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - researcher-api
+    environment:
+      JSON_WEBHOOK_BEARER_TOKEN: ${PIPELINE_WEBHOOK_BEARER_TOKEN:-}
+      JSON_WEBHOOK_HMAC_SECRET: ${PIPELINE_WEBHOOK_HMAC_SECRET:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+
+  researcher-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "researcher", "server"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+      PIPELINE_WEBHOOK_BEARER_TOKEN: ${PIPELINE_WEBHOOK_BEARER_TOKEN:-}
+      PIPELINE_WEBHOOK_HMAC_SECRET: ${PIPELINE_WEBHOOK_HMAC_SECRET:-}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  researcher-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "researcher", "worker"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  analyst-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "analyst"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  executor-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "executor", "server"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  executor-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "executor", "worker"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  approval-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "executor", "approval"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+  outcome-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    command: ["python", "-m", "outcome"]
+    depends_on:
+      - postgres
+    environment:
+      PIPELINE_DATABASE_URL: ${PIPELINE_DATABASE_URL:-postgresql://sentinel:sentinel@postgres:5432/sentinel}
+    volumes:
+      - ./pipeline.yaml:/app/pipeline.yaml:ro
+
+volumes:
+  pipeline-postgres:
