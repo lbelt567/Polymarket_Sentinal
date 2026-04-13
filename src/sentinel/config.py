@@ -58,10 +58,10 @@ class DetectorConfig:
 class StorageConfig:
     sqlite_path: str
     hot_retention_hours: int
-    shift_event_retention_days: int
     archive_dir: str
-    archive_retention_days: int
     archive_interval_sec: int
+    shift_event_retention_days: int = 30
+    archive_retention_days: int = 30
 
 
 @dataclass(slots=True)
@@ -77,11 +77,11 @@ class NotificationsConfig:
     min_abs_move: float
     event_dedup_sec: int
     json_file_dir: str
-    json_file_retention_days: int
     json_webhook_url: str
     discord_webhook_url: str
     telegram_bot_token: str
     telegram_chat_id: str
+    json_file_retention_days: int = 7
     json_webhook_bearer_token: str = ""
     json_webhook_hmac_secret: str = ""
     json_webhook_timeout_sec: int = 10

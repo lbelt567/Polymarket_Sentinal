@@ -1,0 +1,50 @@
+app:
+  env: "dev"
+  log_level: "INFO"
+
+database:
+  url: "${PIPELINE_DATABASE_URL}"
+  pool_size: 10
+
+queue:
+  lease_sec: 60
+  max_attempts: 5
+  retry_backoff_sec: 5
+
+researcher:
+  http_host: "0.0.0.0"
+  http_port: 8001
+  webhook_bearer_token: "${PIPELINE_WEBHOOK_BEARER_TOKEN}"
+  webhook_hmac_secret: "${PIPELINE_WEBHOOK_HMAC_SECRET}"
+  prompt_version: "v1"
+  source_freshness_sec: 21600
+
+analyst:
+  ruleset_version: "v1"
+  min_avg_dollar_volume: 2000000
+  max_spread_bps: 50
+  min_price: 5.0
+  max_price: 500.0
+
+executor:
+  approval_mode: "manual_all"
+  risk_ruleset_version: "v1"
+  max_position_pct: 0.05
+  max_sector_exposure_pct: 0.20
+  max_gross_invested_pct: 0.80
+  max_daily_drawdown_pct: 0.02
+  consecutive_loss_limit: 3
+  cooldown_minutes: 60
+  stale_quote_sec: 30
+  approval_timeout_minutes: 15
+
+broker:
+  provider: "alpaca"
+  paper: true
+  api_key: "${ALPACA_API_KEY}"
+  api_secret: "${ALPACA_API_SECRET}"
+
+notifications:
+  discord_webhook_url: "${DISCORD_WEBHOOK_URL}"
+  telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
+  telegram_chat_id: "${TELEGRAM_CHAT_ID}"

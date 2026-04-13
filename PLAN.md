@@ -1,740 +1,1338 @@
-# Decisive Shift Engine - Implementation Plan (v2)
+# Multi-Agent Trading Pipeline - Tightened V2 Plan
 
 ## Context
 
-Build a 24/7 Polymarket sentiment tracker from scratch (greenfield project). The system monitors prediction market price movements in real-time, detects significant shifts using a multi-timeframe waterfall, and emits structured alerts. A cold archive supports backtesting.
+The Polymarket Sentinel (Scout agent) is complete and running. It monitors prediction markets 24/7, detects price shifts, and emits structured JSON alerts via HTTP webhooks with HMAC signing.
 
-**Downstream consumer:** An AI agent suite will ingest the structured JSON alerts to research broader market impact and decide on trades. Every alert must be self-contained and rich enough for an agent to act on without calling back to the tracker.
+The next step is to build the downstream pipeline that turns a Scout alert into:
 
-**Key discovery: Polymarket's public market data requires NO API keys or authentication.** Both the REST API (Gamma) and WebSocket (CLOB WS) are freely accessible for read-only data. You only need credentials for Discord/Telegram notifications.
+1. A researched catalyst
+2. A validated trade candidate
+3. A risk-checked execution decision
+4. A recorded outcome for later evaluation
 
----
+This version of the plan tightens the original design in four places:
 
-## What You Need to Gather
-
-| Credential | How to Get | Cost |
-|---|---|---|
-| Discord Webhook URL | Server Settings > Integrations > Webhooks > New Webhook | Free |
-| Telegram Bot Token | Message @BotFather on Telegram, `/newbot` | Free |
-| Telegram Chat ID | Message @userinfobot after creating bot | Free |
-| JSON Webhook URL (optional) | Your AI agent suite's HTTP endpoint, or write to a local JSON file | Free |
-| **No Polymarket API key** | Public endpoints are unauthenticated | Free |
+- Scout remains unchanged
+- Long-running work never happens inline on the Scout webhook request
+- Every stage is durable and idempotent
+- The Executor is deterministic and policy-driven, not LLM-driven
 
 ---
 
-## Architecture
+## Goals
 
-```
-              LAYER A: INGESTION
-┌───────────────────────────────────────────────────────┐
-│  Gatekeeper (every 5 min)                             │
-│  GET gamma-api.polymarket.com/events                  │
-│    ?active=true&closed=false&order=volume_24hr         │
-│  Extract markets from nested event response            │
-│  Filters:                                             │
-│    - volume24hr >= $10K                               │
-│    - category NOT IN excluded_categories (Sports)      │
-│    - active=true, closed=false                        │
-│    - min_liquidity >= $5K                             │
-│  Tracks: canonical "Yes" token only per market         │
-│    (resolved by matching outcome label ↔ token id,     │
-│     never by array position alone)                     │
-│  Lifecycle: prune resolved/closed, add new markets     │
-│    from REST + immediate WS market_resolved handling   │
-│  Stores: category, tags, description, event_id,       │
-│          end_date, sibling market ids                  │
-│  Output: subscribe/unsubscribe asset_ids               │
-│                                                       │
-│  WS Client (persistent connection)                    │
-│  wss://ws-subscriptions-clob.polymarket.com/ws/market │
-│  Heartbeat: "PING" text every 10s                     │
-│  Subscribe with custom_feature_enabled=true           │
-│    (required for market_resolved and best_bid_ask)    │
-│  Price signal (composite, priority order):             │
-│    1. Midpoint from book bids[0]/asks[0] if spread    │
-│       ≤ $0.10                                         │
-│    2. Midpoint from price_change best_bid/best_ask    │
-│    3. last_trade_price as fallback                    │
-│  Emits: PriceTick with signal_source tag + quote_ts    │
-│  Reconnect: exponential backoff + jitter              │
-│  Output: asyncio.Queue[PriceTick]                     │
-└──────────────┬────────────────────────────────────────┘
-               │
-               ▼
-              LAYER B: PROCESSING
-┌───────────────────────────────────────────────────────┐
-│  Shift Detector                                       │
-│  dict[asset_id → second-bars] (time-bucketed)         │
-│  Store 1-second aggregates for 6 minutes max          │
-│  Avoid raw-tick hard-cap truncation under load        │
-│                                                       │
-│  Every 1 sec, scan all deques:                        │
-│    L1 Scout:  |ΔP|>8%  in 1min, min 3 ticks → log   │
-│    L2 Confirm: |ΔP|>5% in 3min, min 5 ticks → notify │
-│    L3 Trend:  |ΔP|>3%  in 5min, min 10 ticks → alert │
-│  Quality gate: skip if spread > $0.15, quote stale,   │
-│    or market stale > 2min                             │
-│  Warm-up: allow last_trade-only detection for newly   │
-│    subscribed markets for <= 60s with weak confidence │
-│  Cooldown: 5 min per (market_id, level)               │
-│  Tracks: signed delta, direction, tick count, spread, │
-│    quote freshness                                    │
-│                                                       │
-│  SQLite Hot Buffer (WAL mode, last 48h)               │
-│  Archiver (hourly → Parquet cold storage)             │
-│  Notifier (JSON webhook / Discord / Telegram)         │
-│  Metrics (in-memory counters, logged every 60s)       │
-└──────────────────────────────────────────────────────┘
-               │
-               ▼
-          data/archive/YYYY/MM/DD/HH.parquet
-          (queryable via DuckDB for backtesting)
-```
+- Preserve Scout as the alert producer with zero changes to its runtime behavior
+- Build a reliable downstream pipeline inside this repo as sibling packages
+- Support replay, retries, dead-letter recovery, and full decision tracing
+- Keep the system safe enough for paper trading first and live trading much later
+- Make evaluation and iteration possible by recording structured evidence and outcomes
 
-**Single process, single event loop, 6 concurrent asyncio tasks** (added: metrics logger). Memory footprint remains small because detector state stores second-level bars rather than unbounded raw ticks.
+## Non-Goals For V1
+
+- Live autonomous trading
+- Trading anything beyond U.S. equities and ETFs
+- Short selling, options, crypto spot, or pre/post-market execution
+- A generic orchestration platform
+- Perfect catalyst attribution in every case
 
 ---
 
-## Critical Design Decisions (Mentor Review)
+## Architectural Decisions
 
-### 1. Events API for Discovery (not /markets)
+### 1. Monorepo Stays
 
-The Gamma API's `/events` endpoint is the documented efficient path. Events nest markets inside them, which gives us:
-- Natural grouping (sibling markets in same event)
-- Event-level metadata (title, slug, end_date)
-- Fewer API calls (one event contains multiple markets)
+All agents live in this repo under `src/` as sibling packages.
 
-```
-GET https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume_24hr&ascending=false&limit=100&offset=0
-```
+Rationale:
 
-Response nests markets inside events. We extract individual markets from each event, pulling both event-level and market-level metadata.
+- Solo developer overhead stays low
+- Shared contracts evolve safely in one place
+- Docker images and process entry points are enough separation
+- Cross-stage testing and replay are much easier
 
-### 2. Time-Bucketed Buffers (not fixed maxlen raw ticks)
+### 2. Scout Stays Untouched
 
-**Problem with `deque(maxlen=300)`:** A busy market receiving 10 ticks/sec fills 300 slots in 30 seconds and silently breaks the 3-minute and 5-minute windows.
+Scout keeps posting signed `ShiftAlert` JSON to one downstream webhook endpoint.
 
-**Problem with a raw-tick hard cap:** A plain `deque()` plus hard cap still drops valid in-window history during bursts. That means correctness degrades exactly when the market is most active.
+Rationale:
 
-**Solution:** Aggregate incoming ticks into 1-second bars per asset:
-- Keep one bar per second for the last 6 minutes
-- Each bar stores opening price, closing price, tick count, latest spread, and latest quote timestamp
-- Detection windows run on second-bars, not raw ticks
-- This keeps memory bounded while preserving full 1m/3m/5m coverage even in high-throughput markets
+- The alert payload is already rich
+- The existing HMAC/header pattern is sufficient
+- Avoids risk to the live monitoring system
 
-```python
-@dataclass(slots=True)
-class SecondBar:
-    second_ts_ms: int
-    price_open: float
-    price_last: float
-    tick_count: int
-    spread_last: float | None
-    quote_ts_ms: int | None
+### 3. Webhook At The Edge, Durable Queue Inside
 
-def _upsert_bar(self, bars: deque[SecondBar], tick: PriceTick) -> None:
-    bucket_ms = (tick.timestamp_ms // 1000) * 1000
-    if bars and bars[-1].second_ts_ms == bucket_ms:
-        bar = bars[-1]
-        bar.price_last = tick.price
-        bar.tick_count += 1
-        if tick.spread is not None:
-            bar.spread_last = tick.spread
-            bar.quote_ts_ms = tick.quote_ts_ms
-    else:
-        bars.append(
-            SecondBar(
-                second_ts_ms=bucket_ms,
-                price_open=tick.price,
-                price_last=tick.price,
-                tick_count=1,
-                spread_last=tick.spread,
-                quote_ts_ms=tick.quote_ts_ms,
-            )
-        )
+The original sequential webhook chain is replaced after ingress.
 
-def _prune_bars(self, bars: deque[SecondBar]) -> None:
-    cutoff_ms = current_time_ms() - (360 * 1000)
-    while bars and bars[0].second_ts_ms < cutoff_ms:
-        bars.popleft()
-```
+New rule:
 
-### 3. Composite Price Signal (not last_trade_price only)
+- Scout calls `Researcher API /webhook/alert`
+- The API verifies HMAC, validates the payload, writes to Postgres, enqueues a research job, and returns `202 Accepted`
+- All later work happens in background workers
 
-Polymarket's own UI uses midpoint when spread ≤ $0.10, falling back to last trade when spread is wide. We mirror this logic:
+This avoids:
 
-**Priority order:**
-1. **Book midpoint** from `book` events: `(float(bids[0]["price"]) + float(asks[0]["price"])) / 2` when both sides exist and spread ≤ $0.10
-2. **Price change midpoint** from `price_change` events: `(float(best_bid) + float(best_ask)) / 2` -- these events explicitly include best_bid/best_ask
-3. **Last trade price** from `last_trade_price` events -- fallback for thin/illiquid markets
+- Blocking Scout on LLM/search latency
+- Cascading failures from downstream outages
+- Duplicate downstream side effects from retries without persistence
 
-Each PriceTick records its `signal_source` ("midpoint_book", "midpoint_change", "last_trade") so the detector and alerts can report signal quality.
+### 4. Postgres Is The Pipeline System Of Record
 
-```python
-@dataclass(slots=True)
-class PriceTick:
-    asset_id: str
-    price: float
-    best_bid: float | None    # None if source is last_trade
-    best_ask: float | None
-    spread: float | None
-    signal_source: str         # "midpoint_book" | "midpoint_change" | "last_trade"
-    quote_ts_ms: int | None    # Timestamp of quote data used to derive spread/midpoint
-    timestamp_ms: int
-```
+Postgres is required for the downstream pipeline in all real environments.
 
-**Warm-up behavior for new subscriptions:** newly tracked markets may receive `last_trade_price` events before the first quote-bearing `book` or `price_change` event arrives. During a short warm-up window (default: 60 seconds from subscription), the detector may use `last_trade`-based bars if volume/liquidity filters already passed and min-tick thresholds are met. Any alert emitted in this window is forced to `confidence="weak"`. Once a fresh quote arrives, normal quote freshness rules apply.
+SQLite remains acceptable only for:
 
-### 4. Canonical "Yes" Token Only
+- Local tests
+- Very small single-process experiments
 
-Each market has exactly 2 tokens (Yes and No). Their prices are complementary (sum to ~$1.00). Tracking both would produce duplicate/mirror alerts.
+Rationale:
 
-**Decision:** Track only the canonical "Yes" token's asset_id per market, but do **not** assume array position. The token must be resolved by matching the market's outcomes/outcome labels to the corresponding token ids returned by the API. If the Yes-token mapping is missing or ambiguous, skip that market and log it for review.
+- Multiple services/workers will write concurrently
+- Job leasing and idempotency are easier and safer in Postgres
+- Dead-letter, approval, order, and outcome tracking all want transactional guarantees
 
-A price going UP on the Yes token means the event is becoming more likely. A price going DOWN means less likely. This gives us a single, unambiguous directional signal per market.
+### 5. Executor Must Be Deterministic
 
-### 5. Graduated Thresholds with Quality Gates
+The Executor does not use an LLM to decide whether to place an order.
 
-A flat 5% across all windows is too blunt. Shorter windows need higher thresholds (noise is higher), longer windows can catch subtler moves:
+The Executor may consume upstream analysis, but trade placement is controlled by:
 
-| Level | Window | ΔP Threshold | Min Ticks | Effect |
-|---|---|---|---|---|
-| Scout | 1 min | 8% | 3 | Log only |
-| Confirmation | 3 min | 5% | 5 | Notify |
-| Trend | 5 min | 3% | 10 | Decisive Shift |
+- Deterministic risk rules
+- Broker/account state
+- Approval policy
+- Market session checks
+- Order construction logic
 
-**Quality gates** (skip detection if any fail):
-- Spread > $0.15 → market too illiquid for reliable signal
-- Last tick older than 2 minutes → stale data, wait for fresh ticks
-- Fewer than `min_ticks` in window → insufficient trading activity
+### 6. V1 Trading Scope Is Narrow By Design
 
-### 6. Market Lifecycle Handling
+V1 trading scope:
 
-The gatekeeper runs every 5 minutes and handles:
+- U.S. equities and ETFs only
+- Long-only
+- Paper trading only
+- Regular hours only
+- Limit orders only
+- Every position must have a stop-loss
 
-| Event | Action |
-|---|---|
-| New market passes filters | Add to tracked_markets, subscribe WS |
-| Market volume drops below $10K | Unsubscribe WS, keep in DB (may recover) |
-| Market resolved via WS `market_resolved` | Immediately unsubscribe WS, prune detector state, mark inactive in DB |
-| Market closed/resolved on REST refresh | Reconcile state, mark inactive if WS event was missed |
-| Market reappears after being below threshold | Re-subscribe WS, resume tracking |
-| WS sends no ticks for market for 30+ min | Mark stale, skip detection (don't unsubscribe -- may resume) |
-
-The detector checks `tracked_markets.active` before processing. Dead market state is pruned to free memory, and the gatekeeper remains the reconciliation layer if WS lifecycle events are missed.
-
-**WS subscription requirement:** `market_resolved` and `best_bid_ask` require `custom_feature_enabled: true` in the market-channel subscription payload. REST reconciliation remains mandatory because WS lifecycle events may still be missed in production.
+This keeps the operational surface small while evaluation is still immature.
 
 ---
 
-## Gatekeeper Filters
+## End-To-End Flow
 
-```yaml
-gatekeeper:
-  gamma_api_url: "https://gamma-api.polymarket.com"
-  endpoint: "/events"             # Use events, not markets
-  poll_interval_sec: 300
-  min_volume_24h: 10000
-  min_liquidity: 5000             # NEW: minimum liquidity filter
-  max_markets: 200
-  excluded_categories: ["Sports"]
-  stale_timeout_sec: 1800         # 30 min no ticks → mark stale
+```text
+Scout
+  -> POST /webhook/alert (signed ShiftAlert JSON)
+     Researcher API
+       - verify HMAC
+       - validate ShiftAlert mirror
+       - upsert trace
+       - persist ingest message
+       - enqueue research job
+       - return 202 fast
+
+Postgres
+  -> stage_messages
+  -> stage_jobs
+  -> stage_runs
+  -> approvals
+  -> broker_orders
+  -> outcomes
+
+Researcher Worker
+  -> load ingest message
+  -> run search + source validation + LLM synthesis
+  -> persist ResearchReport
+  -> enqueue analysis job if status=pass
+
+Analyst Worker
+  -> load ResearchReport
+  -> resolve tradable symbols
+  -> fetch market/account context
+  -> compute deterministic filters + ranking
+  -> persist AnalysisReport
+  -> enqueue execution job if status=pass
+
+Executor Worker
+  -> load AnalysisReport
+  -> apply risk engine
+  -> create approval request or place paper order
+  -> persist ExecutionDecision
+  -> schedule outcome observations
+
+Outcome Worker
+  -> capture t+15m, t+1h, next_session_close observations
+  -> persist labels for evaluation and backtesting
 ```
-
-Filtering cascade:
-1. `active=true, closed=false` (API-level)
-2. `category not in excluded_categories` (Sports excluded)
-3. `volume_24h >= min_volume_24h` ($10K)
-4. `liquidity >= min_liquidity` ($5K)
-5. Take top `max_markets` by volume after filtering
 
 ---
 
-## Project Structure
+## Repo Structure
 
-```
+```text
 Polymarket_Sentinal/
-├── pyproject.toml
-├── .env.example
-├── config.yaml
+├── config.yaml                      # Scout config, unchanged
+├── pipeline.yaml                    # New pipeline config
+├── pyproject.toml                   # Expanded dependencies
+├── Dockerfile                       # Scout image, unchanged
+├── Dockerfile.pipeline              # Shared image for pipeline services
+├── docker-compose.yaml              # Orchestrates Scout + pipeline + Postgres
+├── PLAN.md                          # This file
 ├── src/
-│   └── sentinel/
+│   ├── sentinel/                    # Existing Scout, unchanged
+│   ├── contracts/                   # Shared Pydantic v2 data models
+│   │   ├── __init__.py
+│   │   ├── scout.py                 # ShiftAlert mirror
+│   │   ├── common.py                # Envelope, enums, shared primitives
+│   │   ├── research.py              # Research contracts
+│   │   ├── analysis.py              # Analysis contracts
+│   │   └── execution.py             # Execution contracts
+│   ├── pipeline/                    # Shared infra
+│   │   ├── __init__.py
+│   │   ├── config.py
+│   │   ├── db.py
+│   │   ├── queue.py                 # Job leasing, retries, dead-letter
+│   │   ├── idempotency.py
+│   │   ├── tracing.py
+│   │   ├── approvals.py
+│   │   ├── outcomes.py
+│   │   └── migrations/
+│   ├── researcher/
+│   │   ├── __init__.py
+│   │   ├── __main__.py
+│   │   ├── config.py
+│   │   ├── server.py                # FastAPI ingress only
+│   │   ├── worker.py                # Research job runner
+│   │   ├── agent.py                 # LLM orchestration
+│   │   ├── prompts/
+│   │   └── tools/
+│   ├── analyst/
+│   │   ├── __init__.py
+│   │   ├── __main__.py
+│   │   ├── config.py
+│   │   ├── worker.py
+│   │   ├── agent.py
+│   │   ├── filters.py
+│   │   ├── prompts/
+│   │   └── tools/
+│   ├── executor/
+│   │   ├── __init__.py
+│   │   ├── __main__.py
+│   │   ├── config.py
+│   │   ├── server.py                # Health + approval callbacks
+│   │   ├── worker.py
+│   │   ├── broker.py
+│   │   ├── risk/
+│   │   └── approvals/
+│   └── outcome/
 │       ├── __init__.py
-│       ├── __main__.py           # Entry: python -m sentinel
-│       ├── app.py                # Orchestrator, signal handling, shutdown
-│       ├── config.py             # Load config.yaml + .env → dataclasses
-│       ├── ingestion/
-│       │   ├── __init__.py
-│       │   ├── gatekeeper.py     # Events API polling, market discovery, lifecycle
-│       │   ├── ws_client.py      # WebSocket client, composite price signal
-│       │   └── models.py         # Pydantic models for API/WS messages
-│       ├── processing/
-│       │   ├── __init__.py
-│       │   ├── detector.py       # Time-pruned deques, graduated waterfall
-│       │   ├── alerts.py         # ShiftAlert dataclass, AlertLevel enum
-│       │   └── stream.py         # Generic tick stream interface (live + replay)
-│       ├── storage/
-│       │   ├── __init__.py
-│       │   ├── sqlite_store.py   # Hot buffer with batched writes
-│       │   ├── archiver.py       # SQLite → Parquet export + prune
-│       │   └── schema.sql        # DDL for tables + indexes
-│       ├── notifications/
-│       │   ├── __init__.py
-│       │   ├── base.py           # Notifier protocol + dispatch
-│       │   ├── discord.py        # Discord webhook (human-readable)
-│       │   ├── telegram.py       # Telegram bot (human-readable)
-│       │   └── json_webhook.py   # Structured JSON for AI agents
-│       └── utils/
-│           ├── __init__.py
-│           ├── logging.py        # Structured logging setup
-│           └── metrics.py        # In-memory counters + periodic logger
+│       ├── __main__.py
+│       ├── worker.py
+│       └── pricing.py
 ├── tests/
-│   ├── conftest.py
-│   ├── test_detector.py
-│   ├── test_gatekeeper.py
-│   ├── test_sqlite_store.py
-│   ├── test_archiver.py
-│   ├── test_ws_parser.py
-│   └── test_price_signal.py      # NEW: composite price signal tests
-├── scripts/
-│   └── backtest.py               # DuckDB query tool over Parquet archive
-└── data/                          # gitignored runtime data
-    ├── sentinel.db
-    ├── alerts/                    # JSON alert files (one per alert)
-    └── archive/
+│   ├── test_contracts.py
+│   ├── test_queue.py
+│   ├── test_researcher/
+│   ├── test_analyst/
+│   ├── test_executor/
+│   └── test_outcome/
+└── scripts/
+    ├── replay_alert.py
+    └── replay_stage.py
 ```
 
 ---
 
-## Alert Schema (AI Agent Contract)
+## Runtime Components
 
-```json
-{
-  "alert_id": "a1b2c3d4",
-  "alert_level": "trend",
-  "alert_level_label": "Decisive Shift",
-  "timestamp_iso": "2026-04-01T14:32:00Z",
-  "timestamp_ms": 1775234520000,
-  "market": {
-    "asset_id": "71321044878926...",
-    "condition_id": "0xabc123...",
-    "market_id": "mkt_789",
-    "question": "Will the Fed cut rates in June 2026?",
-    "description": "This market resolves YES if the Federal Reserve announces a rate cut at its June 2026 FOMC meeting...",
-    "category": "Economics",
-    "tags": ["fed", "interest-rates", "monetary-policy"],
-    "event_id": "evt_456",
-    "event_title": "Federal Reserve June 2026 Meeting",
-    "event_slug": "fed-june-2026",
-    "sibling_market_slugs": ["fed-hold-june-2026", "fed-hike-june-2026"],
-    "outcome": "Yes",
-    "end_date": "2026-06-15T18:00:00Z",
-    "volume_24h": 250000.0,
-    "liquidity": 180000.0,
-    "polymarket_url": "https://polymarket.com/event/fed-june-2026"
-  },
-  "shift": {
-    "direction": "up",
-    "delta_pct": 7.2,
-    "signed_delta_pct": 7.2,
-    "price_start": 0.45,
-    "price_end": 0.522,
-    "price_current": 0.522,
-    "window_sec": 300,
-    "ticks_in_window": 47
-  },
-  "signal_quality": {
-    "signal_source": "midpoint_book",
-    "best_bid": 0.52,
-    "best_ask": 0.525,
-    "spread": 0.005,
-    "quote_age_sec": 1.2,
-    "liquidity_bucket": "high",
-    "confidence": "strong"
-  }
-}
-```
+### Researcher API
 
-**New fields vs v1:**
-- `signal_quality.signal_source`: "midpoint_book" | "midpoint_change" | "last_trade" -- tells agents how reliable the price signal is
-- `signal_quality.best_bid` / `best_ask` / `spread`: current orderbook state at alert time
-- `signal_quality.quote_age_sec`: age of the quote used for spread/midpoint checks
-- `signal_quality.liquidity_bucket`: "high" (>$100K), "medium" ($25K-$100K), "low" ($5K-$25K)
-- `signal_quality.confidence`: "strong" and "moderate" require fresh midpoint-backed quotes; warm-up or `last_trade` fallback is always "weak"
-- `market.end_date`: when the market closes -- agents need this for time-sensitive decisions
-- `market.sibling_market_slugs`: other markets in the same event for correlated analysis
-- `market.event_title`: human-readable event name for agent research context
+Responsibilities:
 
-**Confidence scoring logic:**
-```
-if signal_source.startswith("midpoint") and quote_age_sec <= 5 and spread <= 0.03 and liquidity_bucket == "high" and ticks >= 10:
-    confidence = "strong"
-elif signal_source.startswith("midpoint") and quote_age_sec <= 15 and spread <= 0.10 and ticks >= 5:
-    confidence = "moderate"
-else:
-    confidence = "weak"
-```
+- Receive Scout webhook
+- Verify HMAC signature and headers
+- Validate `ShiftAlert` mirror
+- Write ingest message and research job
+- Return `202 Accepted` quickly
 
-**Delivery modes** (configurable, not mutually exclusive):
-1. **JSON file:** Write each alert as `data/alerts/{timestamp}_{asset_id}.json` -- simplest, agents poll the directory
-2. **HTTP POST:** POST to a configurable URL endpoint -- for when agents run as a server
-3. **Discord/Telegram:** Human-readable summaries for your own monitoring
+Non-responsibilities:
+
+- No inline search
+- No inline LLM call
+- No direct call to Analyst
+
+### Researcher Worker
+
+Responsibilities:
+
+- Find and validate catalyst evidence
+- Produce `ResearchReport`
+- Persist structured evidence, audit metadata, and stage result
+
+### Analyst Worker
+
+Responsibilities:
+
+- Turn asset hypotheses into tradable candidates
+- Resolve symbol eligibility
+- Pull market data and compute deterministic filters
+- Produce `AnalysisReport`
+
+### Executor Worker
+
+Responsibilities:
+
+- Apply risk engine
+- Check broker/account state
+- Create approval request or place paper trade
+- Produce `ExecutionDecision`
+
+### Executor API
+
+Responsibilities:
+
+- Health checks
+- Approval callbacks and approval status endpoints
+
+### Outcome Worker
+
+Responsibilities:
+
+- Observe post-trade and post-signal performance
+- Write evaluation labels for future tuning
 
 ---
 
-## Storage Design
+## Data Contracts
 
-**Hot buffer (SQLite, WAL mode):**
-```sql
-CREATE TABLE price_ticks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id        TEXT    NOT NULL,
-    market_slug     TEXT    NOT NULL,
-    price           REAL    NOT NULL,
-    best_bid        REAL,               -- NULL if source is last_trade
-    best_ask        REAL,
-    spread          REAL,
-    signal_source   TEXT    NOT NULL,    -- 'midpoint_book' | 'midpoint_change' | 'last_trade'
-    quote_ts_ms     INTEGER,             -- NULL if source has no quote backing
-    ts_ms           INTEGER NOT NULL
-);
-CREATE INDEX idx_price_ticks_asset_ts ON price_ticks (asset_id, ts_ms DESC);
-CREATE INDEX idx_price_ticks_ts ON price_ticks (ts_ms);
+All stage payloads are Pydantic v2 models under `src/contracts/`.
 
-CREATE TABLE shift_events (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id            TEXT    NOT NULL,
-    market_slug         TEXT    NOT NULL,
-    question            TEXT    NOT NULL,
-    category            TEXT    NOT NULL,
-    level               TEXT    NOT NULL,    -- 'scout' | 'confirmation' | 'trend'
-    direction           TEXT    NOT NULL,    -- 'up' | 'down'
-    delta_pct           REAL    NOT NULL,    -- always positive
-    signed_delta_pct    REAL    NOT NULL,    -- positive=up, negative=down
-    price_start         REAL    NOT NULL,
-    price_end           REAL    NOT NULL,
-    window_sec          INTEGER NOT NULL,
-    ticks_in_window     INTEGER NOT NULL,
-    signal_source       TEXT    NOT NULL,
-    spread_at_alert     REAL,
-    quote_age_sec       REAL,
-    confidence          TEXT    NOT NULL,    -- 'strong' | 'moderate' | 'weak'
-    ts_ms               INTEGER NOT NULL
-);
-CREATE INDEX idx_shift_events_ts ON shift_events (ts_ms DESC);
-CREATE INDEX idx_shift_events_category ON shift_events (category, ts_ms DESC);
+### Shared Rules
 
-CREATE TABLE tracked_markets (
-    asset_id    TEXT PRIMARY KEY,
-    market_id   TEXT NOT NULL,
-    condition_id TEXT NOT NULL DEFAULT '',
-    market_slug TEXT NOT NULL,
-    question    TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    category    TEXT NOT NULL DEFAULT '',
-    tags        TEXT NOT NULL DEFAULT '[]',   -- JSON array
-    event_id    TEXT NOT NULL DEFAULT '',
-    event_title TEXT NOT NULL DEFAULT '',
-    event_slug  TEXT NOT NULL DEFAULT '',
-    sibling_ids TEXT NOT NULL DEFAULT '[]',   -- JSON array of sibling asset_ids
-    outcome     TEXT NOT NULL,                -- always 'Yes' (canonical token)
-    end_date    TEXT,                         -- market close date ISO
-    volume_24h  REAL NOT NULL,
-    liquidity   REAL NOT NULL DEFAULT 0,
-    active      INTEGER NOT NULL DEFAULT 1,
-    subscribed_at_ms INTEGER NOT NULL DEFAULT 0,
-    last_tick_ms INTEGER NOT NULL DEFAULT 0,  -- for staleness detection
-    last_update INTEGER NOT NULL
-);
-```
+- Every stage output is wrapped in a `PipelineEnvelope`
+- Every envelope has a unique `message_id`
+- Every envelope has an `idempotency_key`
+- Every envelope includes `schema_version`
+- Breaking changes bump `schema_version`
+- Do not store chain-of-thought
+- Store structured evidence, tool usage, and short summaries instead
 
-**Cold archive:** Parquet files at `data/archive/YYYY/MM/DD/HH.parquet`, queryable via DuckDB with `read_parquet('data/archive/**/*.parquet')`.
-
-**Pragmas:** `journal_mode=WAL`, `synchronous=NORMAL`, `cache_size=-64000`
-
----
-
-## Key Algorithm: Delta Computation
+### PipelineEnvelope
 
 ```python
-def _compute_delta(
-    bars: deque[SecondBar], window_sec: int, min_ticks: int
-) -> tuple[float, float, float, float, int] | None:
-    """Returns (delta_pct, signed_delta_pct, start_price, end_price, tick_count) or None.
-    Uses 1-second bars to preserve full windows under high throughput."""
-    if len(bars) < 2:
-        return None
-    now_ms = bars[-1].second_ts_ms
-    cutoff_ms = now_ms - (window_sec * 1000)
-    start_price = None
-    tick_count = 0
-    for bar in bars:
-        if bar.second_ts_ms >= cutoff_ms:
-            if start_price is None:
-                start_price = bar.price_open
-            tick_count += bar.tick_count
-    if start_price is None or start_price == 0:
-        return None
-    if tick_count < min_ticks:
-        return None  # Quality gate: not enough trading activity
-    end_price = bars[-1].price_last
-    signed_delta = (end_price - start_price) / start_price * 100.0
-    delta_pct = abs(signed_delta)
-    return (delta_pct, signed_delta, start_price, end_price, tick_count)
+class PipelineEnvelope(BaseModel):
+    message_id: UUID
+    trace_id: UUID
+    source_alert_id: str
+    parent_message_id: UUID | None
+    stage: Literal["ingest", "research", "analysis", "execution", "approval", "outcome"]
+    schema_version: str
+    idempotency_key: str
+    created_at: datetime
+    payload: dict[str, Any]
 ```
 
-**Quality gates applied before detection:**
+### IngestedAlert
+
 ```python
-def _should_skip(self, asset_id: str, bars: deque[SecondBar]) -> bool:
-    # Stale: no tick in last 2 minutes
-    if current_time_ms() - bars[-1].second_ts_ms > 120_000:
-        return True
-    latest_with_quote = next((b for b in reversed(bars) if b.spread_last is not None), None)
-    if latest_with_quote is None:
-        market = self._store.get_tracked_market(asset_id)
-        if market and current_time_ms() - market.subscribed_at_ms <= 60_000:
-            return False  # Warm-up: allow trade-only detection with weak confidence
-        return True
-    quote_age_ms = current_time_ms() - (latest_with_quote.quote_ts_ms or 0)
-    if quote_age_ms > 15_000:
-        return True
-    if latest_with_quote.spread_last > 0.15:
-        return True
-    # Market inactive
-    market = self._store.get_tracked_market(asset_id)
-    if market and not market.active:
-        return True
-    return False
+class IngestedAlert(BaseModel):
+    shift_alert: ShiftAlertMirror
+    received_at: datetime
+    signature_verified: bool
+    replay_source: str | None = None
+    priority: int = 100
+```
+
+### EvidenceItem
+
+```python
+class EvidenceItem(BaseModel):
+    url: str
+    title: str
+    publisher: str
+    published_at: datetime | None
+    retrieved_at: datetime
+    source_tier: Literal["primary", "major_press", "secondary"]
+    relevance_score: float
+    claim_tag: str
+```
+
+### AssetHypothesis
+
+```python
+class AssetHypothesis(BaseModel):
+    symbol: str
+    instrument_type: Literal["equity", "etf"]
+    direction: Literal["bullish", "bearish"]
+    horizon: Literal["intraday", "swing"]
+    linkage_type: Literal["direct", "supplier", "competitor", "sector_proxy", "macro_proxy"]
+    confidence: Literal["high", "medium", "low"]
+    tradable_universe: bool
+    rationale_summary: str
+```
+
+### ResearchReport
+
+```python
+class ResearchReport(BaseModel):
+    status: Literal["pass", "defer", "insufficient_evidence", "conflicting_evidence"]
+    catalyst_type: Literal["policy", "economic_data", "geopolitical", "corporate", "legal", "other"]
+    catalyst_summary: str
+    catalyst_started_at: datetime | None
+    freshness_sec: int | None
+    evidence: list[EvidenceItem]
+    asset_hypotheses: list[AssetHypothesis]
+    unsupported_claims: list[str]
+    stage_summary: str
+```
+
+### FilterResult
+
+```python
+class FilterResult(BaseModel):
+    name: str
+    passed: bool
+    value: str
+    reason: str
+```
+
+### TradeCandidate
+
+```python
+class TradeCandidate(BaseModel):
+    candidate_id: UUID
+    symbol: str
+    side: Literal["buy"]
+    thesis_horizon: Literal["intraday", "swing"]
+    broker_eligible: bool
+    market_snapshot: dict[str, Any]
+    features: dict[str, Any]
+    filters: list[FilterResult]
+    score: float
+    max_notional: Decimal
+    stop_loss_pct: Decimal
+    expiry_at: datetime
+```
+
+### AnalysisReport
+
+```python
+class AnalysisReport(BaseModel):
+    status: Literal["pass", "reject", "needs_review"]
+    candidates: list[TradeCandidate]
+    rejected_candidates: list[TradeCandidate]
+    portfolio_snapshot_id: UUID
+    stage_summary: str
+```
+
+### TradeIntent
+
+```python
+class TradeIntent(BaseModel):
+    candidate_id: UUID
+    symbol: str
+    side: Literal["buy"]
+    order_type: Literal["limit"]
+    tif: Literal["day"]
+    max_notional: Decimal
+    limit_price: Decimal
+    stop_loss_pct: Decimal
+    max_slippage_bps: int
+    thesis_horizon: Literal["intraday", "swing"]
+```
+
+### RiskCheckResult
+
+```python
+class RiskCheckResult(BaseModel):
+    name: str
+    passed: bool
+    measured_value: str
+    threshold: str
+    reason: str
+```
+
+### ExecutionDecision
+
+```python
+class ExecutionDecision(BaseModel):
+    status: Literal[
+        "rejected_risk",
+        "awaiting_approval",
+        "approved",
+        "submitted",
+        "partially_filled",
+        "filled",
+        "cancelled",
+        "expired",
+        "error",
+    ]
+    selected_candidate_id: UUID | None
+    intent: TradeIntent | None
+    risk_checks: list[RiskCheckResult]
+    approval_id: UUID | None
+    broker_order_ids: list[str]
+    stage_summary: str
+```
+
+### StageAudit
+
+This is the audit artifact stored alongside the stage run. It replaces any idea of storing raw chain-of-thought.
+
+```python
+class StageAudit(BaseModel):
+    message_id: UUID
+    model_name: str | None
+    prompt_version: str | None
+    tool_calls: list[dict[str, Any]]
+    token_input: int = 0
+    token_output: int = 0
+    latency_ms: int = 0
+    cost_usd: Decimal = Decimal("0")
+    error: str | None = None
 ```
 
 ---
 
-## Generic Stream Interface (Replay/Backfill Support)
+## Database Design
 
-The detector consumes a `TickStream` protocol, not a raw WebSocket. This allows the same detection logic to run on live data and historical replays:
+The downstream pipeline uses Postgres as the system of record.
 
-```python
-from typing import Protocol, AsyncIterator
+### 1. `pipeline_traces`
 
-class TickStream(Protocol):
-    async def ticks(self) -> AsyncIterator[PriceTick]: ...
+Purpose:
 
-class LiveStream:
-    """Wraps asyncio.Queue fed by ws_client."""
-    def __init__(self, queue: asyncio.Queue[PriceTick]) -> None: ...
-    async def ticks(self) -> AsyncIterator[PriceTick]:
-        while True:
-            yield await self._queue.get()
+- One row per end-to-end alert flow
 
-class ReplayStream:
-    """Reads from Parquet archive via DuckDB for backtesting."""
-    def __init__(self, parquet_glob: str, speed: float = 1.0) -> None: ...
-    async def ticks(self) -> AsyncIterator[PriceTick]:
-        # Query DuckDB, yield rows as PriceTick, respect original timing * speed
-        ...
-```
+Columns:
 
-The detector's `_ingest_loop` consumes `async for tick in stream.ticks()` -- same code path for live and replay. The `backtest.py` script uses `ReplayStream` + `ShiftDetector` to validate detection logic against historical data.
+- `trace_id UUID PRIMARY KEY`
+- `source_alert_id TEXT UNIQUE NOT NULL`
+- `market_asset_id TEXT`
+- `market_slug TEXT`
+- `event_slug TEXT`
+- `current_stage TEXT NOT NULL`
+- `status TEXT NOT NULL`
+- `created_at TIMESTAMPTZ NOT NULL`
+- `updated_at TIMESTAMPTZ NOT NULL`
+
+### 2. `stage_messages`
+
+Purpose:
+
+- Immutable record of each envelope/payload
+
+Columns:
+
+- `message_id UUID PRIMARY KEY`
+- `trace_id UUID NOT NULL REFERENCES pipeline_traces(trace_id)`
+- `stage TEXT NOT NULL`
+- `parent_message_id UUID NULL REFERENCES stage_messages(message_id)`
+- `schema_version TEXT NOT NULL`
+- `idempotency_key TEXT NOT NULL UNIQUE`
+- `payload_jsonb JSONB NOT NULL`
+- `payload_hash TEXT NOT NULL`
+- `created_at TIMESTAMPTZ NOT NULL`
+
+### 3. `stage_jobs`
+
+Purpose:
+
+- Durable job queue for workers
+
+Columns:
+
+- `job_id UUID PRIMARY KEY`
+- `trace_id UUID NOT NULL REFERENCES pipeline_traces(trace_id)`
+- `stage TEXT NOT NULL`
+- `message_id UUID NOT NULL REFERENCES stage_messages(message_id)`
+- `state TEXT NOT NULL`
+- `priority INT NOT NULL DEFAULT 100`
+- `attempt_count INT NOT NULL DEFAULT 0`
+- `available_at TIMESTAMPTZ NOT NULL`
+- `leased_until TIMESTAMPTZ NULL`
+- `worker_id TEXT NULL`
+- `last_error TEXT NULL`
+- `created_at TIMESTAMPTZ NOT NULL`
+- `updated_at TIMESTAMPTZ NOT NULL`
+
+Constraints:
+
+- `UNIQUE(stage, message_id)`
+
+### 4. `stage_runs`
+
+Purpose:
+
+- Record each execution attempt of a job
+
+Columns:
+
+- `run_id UUID PRIMARY KEY`
+- `job_id UUID NOT NULL REFERENCES stage_jobs(job_id)`
+- `message_id UUID NOT NULL REFERENCES stage_messages(message_id)`
+- `started_at TIMESTAMPTZ NOT NULL`
+- `finished_at TIMESTAMPTZ NULL`
+- `result_state TEXT NOT NULL`
+- `model_name TEXT NULL`
+- `prompt_version TEXT NULL`
+- `token_input INT NOT NULL DEFAULT 0`
+- `token_output INT NOT NULL DEFAULT 0`
+- `cost_usd NUMERIC(18,8) NOT NULL DEFAULT 0`
+- `latency_ms INT NOT NULL DEFAULT 0`
+- `tool_calls_jsonb JSONB NOT NULL DEFAULT '[]'::jsonb`
+- `error_jsonb JSONB NULL`
+
+### 5. `research_evidence`
+
+Purpose:
+
+- Normalize evidence records for analysis and review
+
+Columns:
+
+- `evidence_id UUID PRIMARY KEY`
+- `message_id UUID NOT NULL REFERENCES stage_messages(message_id)`
+- `url TEXT NOT NULL`
+- `title TEXT NOT NULL`
+- `publisher TEXT NOT NULL`
+- `published_at TIMESTAMPTZ NULL`
+- `retrieved_at TIMESTAMPTZ NOT NULL`
+- `source_tier TEXT NOT NULL`
+- `relevance_score DOUBLE PRECISION NOT NULL`
+- `claim_tag TEXT NOT NULL`
+
+### 6. `analysis_candidates`
+
+Purpose:
+
+- Persist candidates and rejections in queryable form
+
+Columns:
+
+- `candidate_id UUID PRIMARY KEY`
+- `message_id UUID NOT NULL REFERENCES stage_messages(message_id)`
+- `symbol TEXT NOT NULL`
+- `side TEXT NOT NULL`
+- `status TEXT NOT NULL`
+- `score DOUBLE PRECISION NOT NULL`
+- `broker_eligible BOOLEAN NOT NULL`
+- `max_notional NUMERIC(18,8) NOT NULL`
+- `stop_loss_pct NUMERIC(18,8) NOT NULL`
+- `features_jsonb JSONB NOT NULL`
+- `filters_jsonb JSONB NOT NULL`
+
+### 7. `portfolio_snapshots`
+
+Purpose:
+
+- Capture deterministic account state at analysis/execution time
+
+Columns:
+
+- `snapshot_id UUID PRIMARY KEY`
+- `captured_at TIMESTAMPTZ NOT NULL`
+- `account_id TEXT NOT NULL`
+- `equity NUMERIC(18,8) NOT NULL`
+- `cash NUMERIC(18,8) NOT NULL`
+- `buying_power NUMERIC(18,8) NOT NULL`
+- `gross_exposure NUMERIC(18,8) NOT NULL`
+- `net_exposure NUMERIC(18,8) NOT NULL`
+- `sector_exposure_jsonb JSONB NOT NULL`
+- `positions_jsonb JSONB NOT NULL`
+
+### 8. `approval_requests`
+
+Purpose:
+
+- Track human approval workflow
+
+Columns:
+
+- `approval_id UUID PRIMARY KEY`
+- `trace_id UUID NOT NULL REFERENCES pipeline_traces(trace_id)`
+- `candidate_id UUID NOT NULL`
+- `channel TEXT NOT NULL`
+- `status TEXT NOT NULL`
+- `requested_at TIMESTAMPTZ NOT NULL`
+- `expires_at TIMESTAMPTZ NOT NULL`
+- `decided_at TIMESTAMPTZ NULL`
+- `approver_id TEXT NULL`
+- `decision_reason TEXT NULL`
+- `callback_token TEXT NOT NULL UNIQUE`
+
+### 9. `broker_orders`
+
+Purpose:
+
+- Record submitted and updated broker orders
+
+Columns:
+
+- `order_id UUID PRIMARY KEY`
+- `trace_id UUID NOT NULL REFERENCES pipeline_traces(trace_id)`
+- `candidate_id UUID NOT NULL`
+- `client_order_id TEXT NOT NULL UNIQUE`
+- `broker TEXT NOT NULL`
+- `broker_order_id TEXT UNIQUE`
+- `symbol TEXT NOT NULL`
+- `side TEXT NOT NULL`
+- `qty NUMERIC(18,8) NULL`
+- `notional NUMERIC(18,8) NULL`
+- `order_type TEXT NOT NULL`
+- `tif TEXT NOT NULL`
+- `submitted_at TIMESTAMPTZ NOT NULL`
+- `status TEXT NOT NULL`
+- `avg_fill_price NUMERIC(18,8) NULL`
+- `stop_order_id TEXT NULL`
+- `raw_response_jsonb JSONB NOT NULL`
+
+### 10. `dead_letters`
+
+Purpose:
+
+- Preserve terminally failed jobs for replay and debugging
+
+Columns:
+
+- `dead_letter_id UUID PRIMARY KEY`
+- `job_id UUID NOT NULL REFERENCES stage_jobs(job_id)`
+- `stage TEXT NOT NULL`
+- `reason TEXT NOT NULL`
+- `payload_jsonb JSONB NOT NULL`
+- `first_failed_at TIMESTAMPTZ NOT NULL`
+- `last_failed_at TIMESTAMPTZ NOT NULL`
+- `replay_count INT NOT NULL DEFAULT 0`
+- `resolved_at TIMESTAMPTZ NULL`
+
+### 11. `outcome_observations`
+
+Purpose:
+
+- Label downstream performance of signals and trades
+
+Columns:
+
+- `observation_id UUID PRIMARY KEY`
+- `trace_id UUID NOT NULL REFERENCES pipeline_traces(trace_id)`
+- `symbol TEXT NOT NULL`
+- `horizon TEXT NOT NULL`
+- `scheduled_for TIMESTAMPTZ NOT NULL`
+- `observed_at TIMESTAMPTZ NULL`
+- `entry_price NUMERIC(18,8) NOT NULL`
+- `exit_price NUMERIC(18,8) NULL`
+- `return_pct NUMERIC(18,8) NULL`
+- `benchmark_return_pct NUMERIC(18,8) NULL`
+- `label TEXT NULL`
 
 ---
 
-## Observability
+## Queue And Idempotency Model
 
-In-memory counters logged every 60 seconds:
+### Job States
 
-```python
-@dataclass
-class Metrics:
-    tracked_markets: int = 0          # Currently tracked
-    ws_reconnects: int = 0            # Total since start
-    ticks_ingested: int = 0           # Total ticks received
-    ticks_per_minute: int = 0         # Rolling 1-min rate
-    ticks_dropped_parse_error: int = 0
-    ticks_dropped_stale: int = 0
-    ticks_dropped_quote_stale: int = 0
-    market_resolved_ws_events: int = 0
-    alerts_scout: int = 0
-    alerts_confirmation: int = 0
-    alerts_trend: int = 0
-    alerts_skipped_cooldown: int = 0
-    alerts_skipped_quality: int = 0   # Skipped by quality gates
-    archive_lag_sec: float = 0        # Time since last successful archive
-    last_gatekeeper_run_iso: str = ""
-    signal_source_counts: dict = field(default_factory=dict)  # midpoint_book: N, last_trade: M
+All stage jobs move through the same generic job lifecycle:
+
+- `queued`
+- `leased`
+- `running`
+- `retry_wait`
+- `succeeded`
+- `dead_letter`
+- `cancelled`
+
+### Leasing Strategy
+
+Workers lease jobs with `FOR UPDATE SKIP LOCKED`.
+
+Each worker loop:
+
+1. Select next available job by `stage`, `priority`, and `available_at`
+2. Lease it for a bounded interval
+3. Mark run start in `stage_runs`
+4. Process
+5. Write output message and next job in one transaction when possible
+6. Mark success or failure
+
+### Idempotency Keys
+
+Required keys:
+
+- Ingest: `scout:{alert_id}`
+- Research: `research:{parent_message_id}:{prompt_version}`
+- Analysis: `analysis:{parent_message_id}:{ruleset_version}:{data_snapshot_ts}`
+- Execution: `execution:{parent_message_id}:{risk_ruleset_version}:{approval_mode}`
+- Outcome: `outcome:{trace_id}:{horizon}`
+
+### Broker Idempotency
+
+`client_order_id` must be deterministic from:
+
+- `trace_id`
+- `candidate_id`
+- `risk_ruleset_version`
+
+This prevents duplicate order placement after retries or restarts.
+
+### Replay Rules
+
+- Replaying a raw Scout alert should not create a second trace if the original still exists and matches
+- Replaying a dead-letter job creates a new run, not a new trace
+- Replaying a stage should preserve `trace_id` and create a new `message_id`
+
+---
+
+## Per-Stage State Machines
+
+### Ingress State Machine
+
+```text
+received
+  -> verified
+  -> persisted
+  -> research_queued
+  -> acknowledged
+
+received
+  -> invalid_signature
+
+received
+  -> invalid_payload
+
+received
+  -> duplicate
 ```
 
-Logged as structured JSON to both stdout and `data/sentinel.log` every 60 seconds. This is essential for debugging 24/7 operation -- you'll know immediately if tick rates drop, reconnects spike, or quality gates are rejecting everything.
+### Researcher State Machine
+
+```text
+queued
+  -> researching
+  -> pass
+
+queued
+  -> researching
+  -> defer
+
+queued
+  -> researching
+  -> insufficient_evidence
+
+queued
+  -> researching
+  -> conflicting_evidence
+
+researching
+  -> retry_wait
+
+researching
+  -> dead_letter
+```
+
+Pass criteria:
+
+- At least one primary source or two major press sources
+- Source freshness inside configured window
+- At least one tradable equity or ETF hypothesis
+- No unresolved contradiction in the core catalyst
+
+### Analyst State Machine
+
+```text
+queued
+  -> loading_market_data
+  -> scoring
+  -> pass
+
+queued
+  -> loading_market_data
+  -> scoring
+  -> reject
+
+queued
+  -> loading_market_data
+  -> scoring
+  -> needs_review
+
+loading_market_data
+  -> retry_wait
+
+loading_market_data
+  -> dead_letter
+```
+
+Pass criteria:
+
+- Symbol is broker-tradable
+- Market session is regular-hours eligible
+- Spread and slippage constraints pass
+- Minimum liquidity and average volume pass
+- Stop-loss distance is feasible
+- Portfolio budget is available
+
+### Executor State Machine
+
+```text
+queued
+  -> risk_checking
+  -> rejected_risk
+
+queued
+  -> risk_checking
+  -> awaiting_approval
+
+queued
+  -> risk_checking
+  -> submitting
+
+awaiting_approval
+  -> approved
+  -> submitting
+
+awaiting_approval
+  -> rejected
+
+awaiting_approval
+  -> expired
+
+submitting
+  -> submitted
+  -> filled
+
+submitted
+  -> partially_filled
+
+submitted
+  -> cancelled
+
+submitted
+  -> expired
+
+submitting
+  -> error
+```
+
+### Approval State Machine
+
+```text
+requested
+  -> delivered
+  -> approved
+
+requested
+  -> delivered
+  -> rejected
+
+requested
+  -> expired
+
+requested
+  -> cancelled
+```
+
+### Outcome State Machine
+
+```text
+scheduled
+  -> pending
+  -> observed
+  -> scored
+
+pending
+  -> missed_data
+  -> retry_wait
+```
+
+---
+
+## Researcher Design
+
+### Inputs
+
+- `IngestedAlert`
+- Source freshness config
+- Search provider config
+- Prompt version
+
+### Outputs
+
+- `ResearchReport`
+- `StageAudit`
+
+### Search Strategy
+
+Primary tools:
+
+- Brave Search
+- Serper fallback
+
+Source preference:
+
+- Primary sources first when available
+- Major press second
+- Secondary summaries only as support
+
+Examples of primary sources:
+
+- Government releases
+- SEC filings
+- Company IR announcements
+- Court rulings
+- Economic calendar releases
+
+### Required Behaviors
+
+- Deduplicate repeated URLs
+- Penalize stale or conflicting sources
+- Resolve ticker universe only to equities or ETFs in v1
+- Explicitly mark unsupported claims instead of hallucinating certainty
+
+---
+
+## Analyst Design
+
+### Inputs
+
+- `ResearchReport`
+- Broker symbol eligibility
+- Market data snapshot
+- Portfolio snapshot
+- Ruleset version
+
+### Outputs
+
+- `AnalysisReport`
+- `StageAudit`
+
+### Deterministic Filters
+
+Initial filter set:
+
+- Instrument is tradable via broker
+- Instrument is not halted
+- Regular market session is open
+- Spread below configured max
+- Average daily dollar volume above configured minimum
+- Price within allowed band
+- Earnings proximity filter if relevant
+- Position size and stop distance feasible
+
+### Suggested Features
+
+- Last price
+- Session return
+- RSI
+- SMA20 / SMA50
+- ATR or realized volatility
+- Gap percentage
+- Average daily volume
+- Relative volume
+
+Notes:
+
+- Fundamentals like `P/E` may be best-effort only
+- Do not make trade eligibility depend on fundamentals being present
+
+---
+
+## Executor Design
+
+### Inputs
+
+- `AnalysisReport`
+- Portfolio snapshot
+- Broker account state
+- Approval mode
+- Risk ruleset version
+
+### Outputs
+
+- `ExecutionDecision`
+- `StageAudit`
+- `broker_orders` records
+
+### Approval Modes
+
+- `manual_all`: every trade requires approval
+- `paper_auto_live_manual`: paper auto, live manual
+- `paper_auto_only`: paper only, no live path enabled
+
+### Trade Construction Rules
+
+- Long-only for v1
+- Limit order only
+- Day time-in-force only
+- Every order includes stop-loss logic
+- One new position per trace
+- No pre-market or after-hours trading
+- Cancel if approval or price snapshot becomes stale
+
+### Hard-Coded Risk Limits
+
+- Max single position: `5%` of account equity
+- Max sector exposure: `20%`
+- Max gross invested: `80%`
+- Daily drawdown halt: `2%`
+- Consecutive loss cooldown: `3 losses -> 1 hour`
+- Quote freshness must pass
+- Open orders must count against available budget
+
+---
+
+## Outcome Tracking
+
+Every execution or rejected opportunity should later be observable for evaluation.
+
+Required horizons:
+
+- `t+15m`
+- `t+1h`
+- `next_session_close`
+
+For each horizon capture:
+
+- Entry price
+- Exit or observed price
+- Return percentage
+- Benchmark return percentage
+- Outcome label
+
+Potential labels:
+
+- `positive_alpha`
+- `flat`
+- `negative_alpha`
+- `missed_move`
+- `execution_not_applicable`
 
 ---
 
 ## Configuration
 
-**`config.yaml`:**
+Add `pipeline.yaml` with sections for:
+
 ```yaml
-gatekeeper:
-  gamma_api_url: "https://gamma-api.polymarket.com"
-  endpoint: "/events"
-  poll_interval_sec: 300
-  min_volume_24h: 10000
-  min_liquidity: 5000
-  max_markets: 200
-  excluded_categories: ["Sports"]
-  stale_timeout_sec: 1800
+app:
+  env: dev
+  log_level: INFO
 
-websocket:
-  url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-  heartbeat_interval_sec: 10
-  reconnect_base_delay_sec: 1
-  reconnect_max_delay_sec: 60
-  custom_feature_enabled: true   # Required for market_resolved and best_bid_ask
-  max_spread_for_midpoint: 0.10
-  max_quote_age_sec: 15           # Ignore stale quotes when deriving midpoint/spread
+database:
+  url: ${PIPELINE_DATABASE_URL}
+  pool_size: 10
 
-detector:
-  check_interval_sec: 1
-  buffer_max_age_sec: 360         # Prune bars older than 6 min
-  bar_interval_sec: 1             # Aggregate ticks into 1-second bars
-  cooldown_sec: 300
-  stale_threshold_sec: 120        # Skip if no tick in 2 min
-  max_spread_for_detection: 0.15  # Skip if spread too wide
-  max_quote_age_sec: 15           # Skip if latest quote is stale
-  warmup_grace_sec: 60            # Allow weak-confidence trade-only detection right after subscribe
-  thresholds:
-    scout:
-      window_sec: 60
-      delta_pct: 8.0
-      min_ticks: 3
-    confirmation:
-      window_sec: 180
-      delta_pct: 5.0
-      min_ticks: 5
-    trend:
-      window_sec: 300
-      delta_pct: 3.0
-      min_ticks: 10
+queue:
+  lease_sec: 60
+  max_attempts: 5
+  retry_backoff_sec: 5
 
-storage:
-  sqlite_path: "data/sentinel.db"
-  hot_retention_hours: 48
-  archive_dir: "data/archive"
-  archive_interval_sec: 3600
+researcher:
+  http_host: 0.0.0.0
+  http_port: 8001
+  webhook_bearer_token: ${PIPELINE_WEBHOOK_BEARER_TOKEN}
+  webhook_hmac_secret: ${PIPELINE_WEBHOOK_HMAC_SECRET}
+  prompt_version: v1
+  source_freshness_sec: 21600
+
+analyst:
+  ruleset_version: v1
+  min_avg_dollar_volume: 2000000
+  max_spread_bps: 50
+
+executor:
+  approval_mode: manual_all
+  risk_ruleset_version: v1
+  max_position_pct: 0.05
+  max_sector_exposure_pct: 0.20
+  max_gross_invested_pct: 0.80
+  max_daily_drawdown_pct: 0.02
+  consecutive_loss_limit: 3
+  cooldown_minutes: 60
+  stale_quote_sec: 30
+
+broker:
+  provider: alpaca
+  paper: true
+  api_key: ${ALPACA_API_KEY}
+  api_secret: ${ALPACA_API_SECRET}
 
 notifications:
-  enabled_channels: ["json_file", "discord"]
-  min_severity: "confirmation"
-  json_file_dir: "data/alerts"
-  json_webhook_url: ""
-  discord_webhook_url: "${DISCORD_WEBHOOK_URL}"
-  telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
-  telegram_chat_id: "${TELEGRAM_CHAT_ID}"
-
-metrics:
-  log_interval_sec: 60
-
-logging:
-  level: "INFO"
-  file: "data/sentinel.log"
-```
-
-**`.env.example`:**
-```
-DISCORD_WEBHOOK_URL=
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-```
-
----
-
-## Dependencies
-
-```toml
-[project]
-name = "polymarket-sentinel"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = [
-    "websockets>=13.0",
-    "aiohttp>=3.9",
-    "aiosqlite>=0.20",
-    "pyarrow>=14.0",
-    "duckdb>=1.0",
-    "pydantic>=2.0",
-    "pyyaml>=6.0",
-    "python-dotenv>=1.0",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+  discord_webhook_url: ${DISCORD_WEBHOOK_URL}
+  telegram_bot_token: ${TELEGRAM_BOT_TOKEN}
+  telegram_chat_id: ${TELEGRAM_CHAT_ID}
 ```
 
 ---
 
 ## Build Sequence
 
-### Phase 1: Foundation
-1. `pyproject.toml` + project scaffolding (all directories + `__init__.py` files)
-2. `config.yaml` + `.env.example` + `config.py` (dataclass-based config loading)
-3. `utils/logging.py` (structured logging to file + stdout)
-4. `utils/metrics.py` (in-memory counters + periodic logger)
-5. `storage/schema.sql` + `sqlite_store.py` (WAL mode, batched inserts, enriched schema)
-6. Unit tests for SQLite store
+### Phase 0 - Foundation
 
-### Phase 2: Ingestion
-7. `ingestion/models.py` (Pydantic models for Events API response + WS events including book/price_change/last_trade/market_resolved)
-8. `ingestion/gatekeeper.py` (Events API polling, market extraction, volume+liquidity+category filters, lifecycle handling, canonical Yes token selection by outcome mapping)
-9. `ingestion/ws_client.py` (connect, heartbeat, subscribe with `custom_feature_enabled`, composite price signal with midpoint priority, quote freshness tracking, market_resolved handling, exponential backoff reconnect)
-10. Unit tests for gatekeeper (sports exclusion, lifecycle transitions, ambiguous token mapping) + WS parsing (all 3 price event types plus market_resolved, midpoint calculation, spread extraction, quote aging, warm-up behavior)
+- Add `pipeline.yaml`
+- Add Postgres service to `docker-compose.yaml`
+- Add dependency groups to `pyproject.toml`
+- Add `src/contracts/`
+- Add `src/pipeline/db.py`, `queue.py`, `idempotency.py`
+- Add SQL migrations for all pipeline tables
 
-### Phase 3: Detection
-11. `processing/alerts.py` (AlertLevel enum, ShiftAlert dataclass with signal_quality fields)
-12. `processing/stream.py` (TickStream protocol, LiveStream, ReplayStream)
-13. `processing/detector.py` (1-second bar aggregation with `price_open`/`price_last`, graduated thresholds, quality gates, cooldown tracking, min_ticks enforcement, warm-up handling)
-14. Unit tests with synthetic price sequences (graduated thresholds, quality gate rejection, spread filtering, stale quote skipping, startup warm-up handling, direction detection, cooldown, burst traffic preservation)
+Exit criteria:
 
-### Phase 4: Notifications + Archival
-15. `notifications/base.py` + `json_webhook.py` (structured JSON with signal_quality -- primary output for AI agents)
-16. `notifications/discord.py` + `telegram.py` (human-readable -- secondary)
-17. `storage/archiver.py` (SQLite → Parquet export + prune old ticks)
-18. Tests for archiver round-trip + JSON alert schema validation (verify all agent-facing fields present)
+- Migrations apply cleanly
+- A basic queue worker can lease and complete a test job
 
-### Phase 5: Orchestration
-19. `app.py` (wire all subsystems, asyncio.gather with 6 tasks, signal handlers, graceful shutdown)
-20. `__main__.py` (entry point)
-21. End-to-end smoke test against live Polymarket
-22. `scripts/backtest.py` (DuckDB query tool using ReplayStream + detector)
+### Phase 1 - Ingress
 
----
+- Build `src/researcher/server.py`
+- Mirror Scout `ShiftAlert` as Pydantic
+- Verify HMAC and headers using Scout-compatible logic
+- Persist `pipeline_traces`, `stage_messages`, and `stage_jobs`
+- Return `202 Accepted` quickly
 
-## Hosting Recommendation
+Exit criteria:
 
-| Option | Cost | Best For |
-|---|---|---|
-| Your local machine | $0/month | Development + initial deployment |
-| Oracle Cloud Free Tier | $0/month forever | 4 ARM vCPUs, 24GB RAM -- best free option |
-| Hetzner VPS | ~$4/month | Cheapest reliable cloud |
-| DigitalOcean | $7/month | Best support + reliability |
+- Replaying a saved Scout alert creates one trace and one research job
+- Replaying the same alert again does not create duplicates
 
-**Start local, move to Oracle Free Tier or Hetzner when you want 24/7 uptime without keeping your machine on.**
+### Phase 2 - Researcher
+
+- Build Brave and Serper wrappers
+- Build source-tiering and freshness checks
+- Build LLM orchestration and prompt versioning
+- Emit `ResearchReport` and `StageAudit`
+- Enqueue analysis only when `status=pass`
+
+Exit criteria:
+
+- Research worker handles real saved alerts
+- Evidence is structured and queryable
+- Conflicting evidence is surfaced explicitly
+
+### Phase 3 - Analyst
+
+- Build market data wrappers
+- Build broker symbol eligibility lookup
+- Build deterministic filters and ranking
+- Persist `AnalysisReport`, `analysis_candidates`, and portfolio snapshot
+- Enqueue execution only when `status=pass`
+
+Exit criteria:
+
+- Candidate generation is deterministic from a fixed input snapshot
+- Rejected candidates carry explicit filter reasons
+
+### Phase 4 - Executor
+
+- Build broker abstraction with Alpaca paper implementation
+- Build risk engine
+- Build approval request flow
+- Build deterministic `TradeIntent`
+- Persist order lifecycle updates
+
+Exit criteria:
+
+- Duplicate retries do not create duplicate orders
+- Approval timeout and stale-price rejection work correctly
+
+### Phase 5 - Outcome Tracking
+
+- Build outcome scheduler
+- Capture horizons and benchmark comparison
+- Persist labels and observations
+
+Exit criteria:
+
+- Each executed trade and each high-confidence rejected signal gets outcome rows
+
+### Phase 6 - Integration
+
+- Wire all services into `docker-compose.yaml`
+- Add replay scripts for ingest and stage-level replay
+- Run end-to-end paper workflow
+
+Exit criteria:
+
+- Full pipeline works from saved Scout alert to recorded outcome
+- Dead-letter replay works without breaking trace continuity
 
 ---
 
 ## Verification Plan
 
-1. **Unit tests:** `pytest tests/` -- composite price signal (midpoint vs fallback), graduated thresholds, quality gates, 1-second bar aggregation with `price_open`, gatekeeper filtering (sports excluded, liquidity gate), canonical Yes-token mapping, WS parsing (book/price_change/last_trade/market_resolved), SQLite round-trips, JSON alert schema, confidence scoring
-2. **Smoke test:** Run `python -m sentinel` for 5 minutes, verify:
-   - Events discovered (not markets), logged with event grouping
-   - No Sports markets in output
-   - WS connected, receiving ticks with signal_source tags (check `data/sentinel.db`)
-   - Metrics logged every 60s showing tracked_markets count, tick rate, signal_source breakdown
-   - Detector scanning (check logs for "scanning N markets")
-3. **Price signal test:** Verify midpoint is preferred over last_trade by checking `signal_source` distribution in DB, verify stale quotes are rejected once `quote_age_sec` exceeds threshold, and verify warm-up alerts are possible but always marked `confidence="weak"`
-4. **Quality gate test:** Find a low-liquidity market, verify detector skips it (check `alerts_skipped_quality` in metrics)
-5. **Notification test:** Temporarily lower thresholds to trigger alerts, verify:
-   - JSON files in `data/alerts/` contain all signal_quality fields
-   - `confidence` field is computed correctly
-   - `sibling_market_slugs` populated for multi-market events
-   - Discord/Telegram messages arrive (if configured)
-6. **Archive test:** Set archive interval to 60 seconds, verify Parquet files appear, query with `scripts/backtest.py`
-7. **Replay test:** Archive some data, then run `backtest.py` using ReplayStream to verify same detection logic works on historical data and produces the same alerts after 1-second aggregation
-8. **Resilience test:** Kill WiFi for 30 seconds, verify WS reconnects, `ws_reconnects` counter increments in metrics
-9. **Lifecycle test:** Verify subscriptions use `custom_feature_enabled=true`, then wait for a market to resolve and confirm `market_resolved_ws_events` increments or REST reconciliation catches it and prunes detector state
+### Unit Tests
+
+- Contract validation and serialization
+- Idempotency key generation
+- Queue leasing and retry behavior
+- Risk rules and circuit-breaker logic
+- Approval token generation and expiry
+
+### Integration Tests
+
+- Ingest valid Scout alert and return `202`
+- Reject bad HMAC
+- Deduplicate duplicate alert delivery
+- Research to analysis handoff
+- Analysis to execution handoff
+- Approval callback flow
+- Broker submission with deterministic `client_order_id`
+
+### Replay Tests
+
+- Replay saved Scout alert JSON through ingress
+- Replay dead-letter jobs back into their stage
+- Replay analysis and execution from stored parent messages
+
+### Paper Trading Validation
+
+- Run pipeline in paper mode for weeks
+- Track fills, slippage, stop behavior, and missed trades
+- Compare signal outcomes vs benchmark
+
+### Cost And Performance
+
+- Record LLM token usage per stage
+- Track stage latency per job
+- Track dead-letter volume
+- Track approval response latency
+
+---
+
+## Operational Guardrails
+
+- Never block Scout on downstream research or execution latency
+- Never let an LLM place an order without deterministic policy checks
+- Never store raw chain-of-thought
+- Never submit a trade if broker/account state is stale
+- Never allow retries to place duplicate orders
+- Never skip outcome tracking if the goal is long-term iteration
+
+---
+
+## Open Editing Knobs
+
+These are expected to change as the system matures:
+
+- Prompt versions
+- Source freshness windows
+- Research source-tier rules
+- Analyst filter thresholds
+- Risk percentages
+- Approval timeout windows
+- Outcome horizons
+- Paper-to-live graduation criteria
+
+---
+
+## Definition Of Done For V1
+
+V1 is complete when all of the following are true:
+
+- Scout posts to the Researcher ingress with no code changes to Scout
+- Ingress persists and enqueues work durably in Postgres
+- Researcher produces structured catalyst reports with evidence
+- Analyst produces deterministic tradable candidates and explicit rejections
+- Executor applies deterministic risk rules and supports manual approval
+- Alpaca paper orders can be placed without duplicate execution on retries
+- Dead-letter jobs can be replayed safely
+- Outcome observations are recorded for later evaluation
+- End-to-end paper trading runs stably for an extended period
