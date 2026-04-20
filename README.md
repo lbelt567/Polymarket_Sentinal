@@ -1,6 +1,6 @@
 # Polymarket Sentinel
 
-A real-time Polymarket prediction market tracker that monitors price movements 24/7, detects significant shifts using a multi-timeframe waterfall, and emits structured JSON alerts designed for consumption by downstream AI agent systems.
+A real-time Polymarket prediction market tracker and multi-agent trading pipeline. Sentinel monitors price movements 24/7, detects significant shifts using a multi-timeframe waterfall, and feeds structured alerts into a four-stage AI agent pipeline (Researcher → Analyst → Executor → Outcome) that autonomously researches catalysts, evaluates trade opportunities, executes orders with risk controls, and tracks performance.
 
 ## What It Does
 
@@ -10,8 +10,12 @@ Sentinel connects to Polymarket's public APIs to:
 2. **Stream live prices** via the CLOB WebSocket, computing composite price signals from order book midpoints
 3. **Detect shifts** using graduated thresholds across three timeframes (1min/3min/5min)
 4. **Emit alerts** as structured JSON files, HTTP webhooks, Discord messages, or Telegram notifications
+5. **Research catalysts** -- AI agent searches the web for news driving the shift, generates asset hypotheses
+6. **Analyze opportunities** -- evaluates hypotheses with technical indicators (RSI, SMA, volatility) and tradability filters
+7. **Execute trades** -- deterministic risk checks (position sizing, sector exposure, circuit breaker) then order submission
+8. **Track outcomes** -- observes trade performance at T+15m, T+1h, and next session close
 
-No API keys are needed for market data -- Polymarket's public endpoints are unauthenticated for read-only access. You only need credentials if you enable Discord or Telegram notifications.
+No API keys are needed for market data -- Polymarket's public endpoints are unauthenticated for read-only access. The trading pipeline requires API keys for web search (Brave/Serper), Claude (LLM reasoning), and your broker.
 
 ## Architecture
 
@@ -66,6 +70,70 @@ No API keys are needed for market data -- Polymarket's public endpoints are unau
 ```
 
 Single process, single event loop, 6 concurrent asyncio tasks. Memory footprint ~5 MB for 200 markets.
+
+## Multi-Agent Trading Pipeline
+
+When Sentinel emits an alert, it enters a four-stage pipeline where independent workers consume jobs from a lease-based queue:
+
+```
+              LAYER C: MULTI-AGENT PIPELINE
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  ┌─────────────┐    ┌─────────────┐    ┌────────────┐  │
+│  │  Researcher  │───▶│   Analyst   │───▶│  Executor  │  │
+│  └─────────────┘    └─────────────┘    └─────┬──────┘  │
+│   Web search,        RSI, SMA, vol,     Risk checks,   │
+│   catalyst ID,       tradability        position size,  │
+│   hypotheses         filters            circuit breaker │
+│                                               │         │
+│                                         ┌─────▼──────┐  │
+│                                         │  Outcome    │  │
+│                                         │  Observer   │  │
+│                                         └────────────┘  │
+│                                          T+15m, T+1h,   │
+│                                          session close   │
+│                                                         │
+│  Infrastructure:                                        │
+│    Queue ── lease-based jobs, retry backoff              │
+│    PipelineDB ── audit trails, portfolio, traces        │
+│    Approvals ── gated execution with timeout tokens     │
+│    Contracts ── typed envelopes between stages          │
+│    Idempotency ── replay-safe dedup keys                │
+│    Circuit Breaker ── 2% daily drawdown / 3 loss limit  │
+│    Tracing ── trace_id across all 6 stages              │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Pipeline Stages
+
+**Researcher** (`python -m researcher`) -- Receives alerts and searches the web (Brave Search / Serper) for catalysts driving the price shift. Queries Polymarket context for related markets. Outputs a `ResearchReport` with catalyst type, evidence items, and 2-5 asset hypotheses with confidence levels.
+
+**Analyst** (`python -m analyst`) -- Evaluates each hypothesis against live market conditions. Runs technical analysis (14-period RSI, SMA 20/50, 20-day realized volatility) and applies filters: tradable status, regular hours, price band $5-$500, spread < 50bps, minimum $2M daily volume. Outputs scored `TradeCandidate`s.
+
+**Executor** (`python -m executor`) -- Performs deterministic risk checks before submitting orders:
+- Position sizing: max 5% of equity per trade
+- Sector exposure: max 20%
+- Gross exposure: max 80%
+- Quote freshness: max 30s
+- Circuit breaker: halts on 2% daily drawdown or 3 consecutive losses
+
+Orders use idempotent client order IDs to prevent duplicate submissions. Execution requires approval (configurable: manual or auto).
+
+**Outcome Observer** (`python -m outcome`) -- Tracks trade performance at scheduled horizons (T+15m, T+1h, next session close). Records entry/exit prices, return percentage, and win/loss/breakeven labels. Reschedules if observation windows haven't arrived yet.
+
+### Data Contracts
+
+Each stage communicates through typed `PipelineEnvelope`s defined in `src/contracts/`:
+
+| From | To | Contract |
+|---|---|---|
+| Sentinel | Researcher | `IngestedAlert` |
+| Researcher | Analyst | `ResearchReport` (hypotheses + evidence) |
+| Analyst | Executor | `TradeCandidate` (scored, filtered) |
+| Executor | Outcome | `ExecutionDecision` (order IDs, fill prices) |
+| Outcome | Archive | `OutcomeObservation` (returns, labels) |
+
+Every envelope carries `message_id`, `trace_id`, `source_alert_id`, `idempotency_key`, and a `StageAudit` with model name, prompt version, token counts, latency, and cost.
 
 ## Alert Schema
 
@@ -341,7 +409,8 @@ Polymarket_Sentinal/
 ├── config.yaml                  # Runtime configuration
 ├── .env.example                 # Template for notification credentials
 ├── pyproject.toml               # Dependencies and build config
-├── src/sentinel/
+│
+├── src/sentinel/                # Stage 0: Market monitoring
 │   ├── __main__.py              # Entry point: python -m sentinel
 │   ├── app.py                   # Orchestrator, 6 async tasks, shutdown
 │   ├── config.py                # YAML + .env loading into dataclasses
@@ -365,7 +434,61 @@ Polymarket_Sentinal/
 │   └── utils/
 │       ├── logging.py           # Structured JSON logging
 │       └── metrics.py           # In-memory counters, periodic log
-├── tests/                       # pytest suite (10 tests)
+│
+├── src/contracts/               # Typed data contracts between stages
+│   ├── common.py                # PipelineEnvelope, StageAudit
+│   ├── scout.py                 # IngestedAlert
+│   ├── research.py              # ResearchReport, Hypothesis, Evidence
+│   ├── analysis.py              # TradeCandidate, AnalysisReport
+│   └── execution.py             # TradeIntent, RiskCheckResult, ExecutionDecision
+│
+├── src/pipeline/                # Shared pipeline infrastructure
+│   ├── queue.py                 # Lease-based job queue with retry backoff
+│   ├── db.py                    # PipelineDB: audit trails, portfolio, traces
+│   ├── approvals.py             # Gated execution with timeout tokens
+│   ├── config.py                # Pipeline configuration (risk rules, approval mode)
+│   ├── runtime.py               # Worker runtime and lifecycle
+│   ├── health.py                # Pipeline health checks
+│   ├── tracing.py               # Cross-stage trace_id propagation
+│   ├── idempotency.py           # Replay-safe dedup keys
+│   ├── outcomes.py              # Outcome scheduling and observation
+│   └── migrations/              # SQLite and Postgres schema migrations
+│
+├── src/researcher/              # Stage 1: Catalyst research
+│   ├── agent.py                 # LLM-powered research agent
+│   ├── worker.py                # Queue consumer
+│   ├── server.py                # HTTP ingress for alerts
+│   ├── tools/
+│   │   ├── brave_search.py      # Brave Search API
+│   │   ├── serper_search.py     # Serper Search API
+│   │   └── polymarket.py        # Polymarket context lookups
+│   └── prompts/                 # System prompts and templates
+│
+├── src/analyst/                 # Stage 2: Technical analysis
+│   ├── agent.py                 # LLM-powered analyst agent
+│   ├── worker.py                # Queue consumer
+│   ├── filters.py               # Tradability filters
+│   ├── tools/
+│   │   ├── market_data.py       # Live quotes, sector info
+│   │   └── technicals.py        # RSI, SMA, volatility
+│   └── prompts/                 # System prompts and templates
+│
+├── src/executor/                # Stage 3: Order execution
+│   ├── agent.py                 # LLM-powered executor agent
+│   ├── worker.py                # Queue consumer
+│   ├── broker.py                # Broker integration
+│   ├── submission.py            # Idempotent order submission
+│   ├── server.py                # HTTP server for approvals
+│   ├── risk/
+│   │   ├── limits.py            # Position, sector, exposure limits
+│   │   └── circuit_breaker.py   # Drawdown and loss streak protection
+│   └── prompts/                 # System prompts and templates
+│
+├── src/outcome/                 # Stage 4: Performance tracking
+│   ├── worker.py                # Scheduled observation consumer
+│   └── pricing.py               # Entry/exit price comparison
+│
+├── tests/                       # pytest suite
 ├── scripts/
 │   └── backtest.py              # DuckDB replay over Parquet archive
 └── data/                        # gitignored runtime data
@@ -400,7 +523,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-Covers: detector delta computation, warm-up grace period, gatekeeper filtering, WebSocket message parsing, composite price signal, SQLite round-trips, archiver Parquet export, and notification dispatch/isolation.
+Covers: detector delta computation, warm-up grace period, gatekeeper filtering, WebSocket message parsing, composite price signal, SQLite round-trips, archiver Parquet export, notification dispatch/isolation, pipeline queue leasing, researcher ingress and agent, analyst technicals and filters, executor risk checks and submission, outcome observations, approval flow, pipeline config, and runtime lifecycle.
 
 ## Design Decisions
 
@@ -411,6 +534,11 @@ Covers: detector delta computation, warm-up grace period, gatekeeper filtering, 
 - **Composite price signal**: Mirrors Polymarket's own UI logic -- midpoint when spread is tight, last trade as fallback. Each tick tagged with `signal_source` for quality assessment.
 - **Two-tier output**: Raw alerts stored in SQLite for analysis. Agent feed filtered by confidence, signal source, price range, liquidity, and event dedup.
 - **Clock injection**: `time_fn: Callable[[], int]` threaded through all components enables deterministic testing and replay.
+- **Lease-based queue**: Workers lease jobs with configurable retry backoff instead of pub/sub, ensuring at-least-once delivery and graceful worker restarts.
+- **Typed contracts**: Each stage communicates through versioned dataclass envelopes (`src/contracts/`), making inter-stage interfaces explicit and testable.
+- **Idempotent execution**: Stable client order IDs derived from message lineage prevent duplicate orders on replay or retry.
+- **Circuit breaker**: Autonomous trading halts automatically on 2% daily drawdown or 3 consecutive losses -- a hard safety net independent of LLM reasoning.
+- **Approval gates**: Execution requires explicit approval (manual or auto), adding a human-in-the-loop checkpoint before real capital is deployed.
 
 ## License
 
